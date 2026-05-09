@@ -121,7 +121,7 @@ torrent-block-rw/
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/torrent-block-rw.git
+git clone https://github.com/atyonekilla/torrent-block-rw.git
 cd torrent-block-rw
 ```
 
