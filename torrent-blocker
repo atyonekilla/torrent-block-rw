@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/torrent-blocker"
+ENV_FILE="${APP_DIR}/.env"
+LAST_ID_FILE="${APP_DIR}/last_id"
+LOCK_FILE="${APP_DIR}/torrent-blocker.lock"
+
+TABLE="torrent_guard"
+SET="blocked_ipv4"
+CHAIN="input"
+
+REQUIRED_COMMANDS=("curl" "jq" "nft" "logger" "flock")
+
+for cmd in "${REQUIRED_COMMANDS[@]}"; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Ошибка: не найдена команда: $cmd"
+    echo "Установи зависимости: apt install -y curl jq nftables util-linux"
+    exit 1
+  fi
+done
+
+if [[ ! -d "$APP_DIR" ]]; then
+  echo "Ошибка: не найдена директория: $APP_DIR"
+  exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+  echo "Torrent Blocker уже запущен, текущий запуск пропущен"
+  exit 0
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Ошибка: не найден файл конфигурации: $ENV_FILE"
+  exit 1
+fi
+
+set -a
+source "$ENV_FILE"
+set +a
+
+BAN_TIMEOUT="${BAN_TIMEOUT:-1h}"
+PAGE_SIZE="${PAGE_SIZE:-100}"
+MAX_PAGES="${MAX_PAGES:-5}"
+
+TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-false}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_ADMIN_ID="${TELEGRAM_ADMIN_ID:-}"
+
+if [[ -z "${REMNAWAVE_API_BASE:-}" ]]; then
+  echo "Ошибка: REMNAWAVE_API_BASE не задан"
+  exit 1
+fi
+
+if [[ -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
+  echo "Ошибка: REMNAWAVE_API_TOKEN не задан"
+  exit 1
+fi
+
+if ! [[ "$BAN_TIMEOUT" =~ ^[0-9]+[smhd]$ ]]; then
+  echo "Ошибка: BAN_TIMEOUT должен быть в формате 30s, 30m, 1h или 1d"
+  exit 1
+fi
+
+if ! [[ "$PAGE_SIZE" =~ ^[0-9]+$ ]] || (( PAGE_SIZE < 1 || PAGE_SIZE > 500 )); then
+  echo "Ошибка: PAGE_SIZE должен быть числом от 1 до 500"
+  exit 1
+fi
+
+if ! [[ "$MAX_PAGES" =~ ^[0-9]+$ ]] || (( MAX_PAGES < 1 || MAX_PAGES > 50 )); then
+  echo "Ошибка: MAX_PAGES должен быть числом от 1 до 50"
+  exit 1
+fi
+
+if [[ "$TELEGRAM_ENABLED" != "true" && "$TELEGRAM_ENABLED" != "false" ]]; then
+  echo "Ошибка: TELEGRAM_ENABLED должен быть true или false"
+  exit 1
+fi
+
+LAST_ID="0"
+
+if [[ -f "$LAST_ID_FILE" ]]; then
+  LAST_ID="$(cat "$LAST_ID_FILE" | tr -dc '0-9')"
+  LAST_ID="${LAST_ID:-0}"
+else
+  echo "0" > "$LAST_ID_FILE"
+  chmod 600 "$LAST_ID_FILE"
+fi
+
+ensure_nft() {
+  nft add table inet "$TABLE" 2>/dev/null || true
+
+  nft add set inet "$TABLE" "$SET" '{ type ipv4_addr; flags timeout; }' 2>/dev/null || true
+
+  nft add chain inet "$TABLE" "$CHAIN" '{ type filter hook input priority -110; policy accept; }' 2>/dev/null || true
+
+  if ! nft list chain inet "$TABLE" "$CHAIN" 2>/dev/null | grep -q "ip saddr @${SET} drop"; then
+    nft add rule inet "$TABLE" "$CHAIN" ip saddr "@${SET}" drop
+  fi
+}
+
+is_ipv4() {
+  local ip="$1"
+
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$o" =~ ^[0-9]+$ ]] || return 1
+    (( o >= 0 && o <= 255 )) || return 1
+  done
+
+  return 0
+}
+
+safe_value() {
+  local value="${1:-}"
+
+  if [[ -z "$value" || "$value" == "null" ]]; then
+    echo "-"
+  else
+    echo "$value"
+  fi
+}
+
+send_telegram() {
+  local text="$1"
+
+  if [[ "$TELEGRAM_ENABLED" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_ADMIN_ID" ]]; then
+    logger -t torrent-blocker "telegram=skip reason=empty_token_or_admin_id"
+    return 0
+  fi
+
+  curl -fsS \
+    --connect-timeout 10 \
+    --max-time 15 \
+    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_ADMIN_ID}" \
+    --data-urlencode "text=${text}" \
+    -d "disable_web_page_preview=true" \
+    >/dev/null 2>&1 || {
+      logger -t torrent-blocker "telegram=failed"
+      return 0
+    }
+}
+
+ban_ip() {
+  local ip="$1"
+  local timeout="$2"
+
+  ensure_nft
+
+  nft delete element inet "$TABLE" "$SET" "{ $ip }" 2>/dev/null || true
+  nft add element inet "$TABLE" "$SET" "{ $ip timeout $timeout }"
+
+  logger -t torrent-blocker "заблокирован ip=$ip время_блокировки=$timeout"
+  echo "ОК: IP $ip заблокирован на $timeout"
+}
+
+fetch_page() {
+  local start="$1"
+
+  curl -fsS \
+    --connect-timeout 10 \
+    --max-time 30 \
+    --retry 2 \
+    --retry-delay 1 \
+    -H "Authorization: Bearer ${REMNAWAVE_API_TOKEN}" \
+    -H "Accept: application/json" \
+    "${REMNAWAVE_API_BASE%/}/api/node-plugins/torrent-blocker?size=${PAGE_SIZE}&start=${start}"
+}
+
+save_last_id() {
+  local new_last_id="$1"
+  local tmp_file
+
+  if ! [[ "$new_last_id" =~ ^[0-9]+$ ]]; then
+    echo "Ошибка: некорректный new_last_id=$new_last_id"
+    exit 1
+  fi
+
+  tmp_file="$(mktemp "${APP_DIR}/last_id.XXXXXX")"
+  echo "$new_last_id" > "$tmp_file"
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$LAST_ID_FILE"
+}
+
+ensure_nft
+
+GLOBAL_MAX_ID="$LAST_ID"
+PROCESSED_COUNT=0
+SKIPPED_COUNT=0
+
+for (( PAGE=0; PAGE<MAX_PAGES; PAGE++ )); do
+  START=$(( PAGE * PAGE_SIZE ))
+
+  DATA="$(fetch_page "$START")"
+
+  RECORD_COUNT="$(echo "$DATA" | jq -r '(.response.records // []) | length')"
+
+  if [[ "$RECORD_COUNT" == "0" ]]; then
+    break
+  fi
+
+  PAGE_MAX_ID="$(echo "$DATA" | jq -r '[.response.records[]?.id // 0] | max // 0')"
+
+  if [[ "$PAGE_MAX_ID" =~ ^[0-9]+$ ]] && (( PAGE_MAX_ID > GLOBAL_MAX_ID )); then
+    GLOBAL_MAX_ID="$PAGE_MAX_ID"
+  fi
+
+  while read -r RECORD; do
+    [[ -z "$RECORD" ]] && continue
+
+    ID="$(echo "$RECORD" | jq -r '.id // 0')"
+
+    BLOCKED="$(echo "$RECORD" | jq -r '.report.actionReport.blocked // false')"
+    ACTION_IP="$(echo "$RECORD" | jq -r '.report.actionReport.ip // empty')"
+    SOURCE="$(echo "$RECORD" | jq -r '.report.xrayReport.source // empty')"
+    PROTOCOL="$(echo "$RECORD" | jq -r '.report.xrayReport.protocol // empty')"
+    OUTBOUND_TAG="$(echo "$RECORD" | jq -r '.report.xrayReport.outboundTag // empty')"
+
+    USER_ID="$(echo "$RECORD" | jq -r '.userId // .report.actionReport.userId // empty')"
+    USERNAME="$(echo "$RECORD" | jq -r '.user.username // empty')"
+    USER_UUID="$(echo "$RECORD" | jq -r '.user.uuid // empty')"
+    NODE_NAME="$(echo "$RECORD" | jq -r '.node.name // empty')"
+    NODE_COUNTRY="$(echo "$RECORD" | jq -r '.node.countryCode // empty')"
+    CREATED_AT="$(echo "$RECORD" | jq -r '.createdAt // empty')"
+
+    CLIENT_IP="$ACTION_IP"
+
+    if [[ -z "$CLIENT_IP" || "$CLIENT_IP" == "null" ]]; then
+      CLIENT_IP="${SOURCE%%:*}"
+    fi
+
+    if [[ "$BLOCKED" != "true" && "$PROTOCOL" != "bittorrent" && "$OUTBOUND_TAG" != "RW_TB_OUTBOUND_BLOCK" ]]; then
+      echo "Пропуск report id=$ID: это не torrent-нарушение"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+
+    if ! is_ipv4 "$CLIENT_IP"; then
+      echo "Пропуск report id=$ID: некорректный IP=$CLIENT_IP"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+
+    USER_ID="$(safe_value "$USER_ID")"
+    USERNAME="$(safe_value "$USERNAME")"
+    USER_UUID="$(safe_value "$USER_UUID")"
+    NODE_NAME="$(safe_value "$NODE_NAME")"
+    NODE_COUNTRY="$(safe_value "$NODE_COUNTRY")"
+    PROTOCOL="$(safe_value "$PROTOCOL")"
+    OUTBOUND_TAG="$(safe_value "$OUTBOUND_TAG")"
+    CREATED_AT="$(safe_value "$CREATED_AT")"
+
+    echo "Найден torrent-report:"
+    echo "  ID report:       $ID"
+    echo "  ID пользователя: $USER_ID"
+    echo "  Логин:           $USERNAME"
+    echo "  UUID:            $USER_UUID"
+    echo "  IP клиента:      $CLIENT_IP"
+    echo "  Нода:            $NODE_NAME"
+    echo "  Страна ноды:     $NODE_COUNTRY"
+    echo "  Протокол:        $PROTOCOL"
+    echo "  Outbound:        $OUTBOUND_TAG"
+    echo "  Создан:          $CREATED_AT"
+
+    ban_ip "$CLIENT_IP" "$BAN_TIMEOUT"
+
+    TELEGRAM_TEXT="🚫 Торрент заблокирован
+
+IP клиента: ${CLIENT_IP}
+Время блокировки: ${BAN_TIMEOUT}
+
+ID report: ${ID}
+ID пользователя: ${USER_ID}
+Логин: ${USERNAME}
+UUID: ${USER_UUID}
+
+Нода: ${NODE_NAME}
+Страна ноды: ${NODE_COUNTRY}
+Протокол: ${PROTOCOL}
+Outbound: ${OUTBOUND_TAG}
+Создан: ${CREATED_AT}"
+
+    send_telegram "$TELEGRAM_TEXT"
+
+    logger -t torrent-blocker \
+      "report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован"
+
+    PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+
+  done < <(
+    echo "$DATA" | jq -c --argjson last "$LAST_ID" '
+      (.response.records // [])
+      | sort_by(.id)
+      | .[]
+      | select((.id | tonumber) > $last)
+    '
+  )
+done
+
+if [[ "$GLOBAL_MAX_ID" =~ ^[0-9]+$ ]] && (( GLOBAL_MAX_ID > LAST_ID )); then
+  save_last_id "$GLOBAL_MAX_ID"
+fi
+
+echo "Готово. Обработано новых reports: $PROCESSED_COUNT. Пропущено: $SKIPPED_COUNT. Был last_id=$LAST_ID, стал last_id=$GLOBAL_MAX_ID"

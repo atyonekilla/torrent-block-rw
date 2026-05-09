@@ -1,0 +1,11 @@
+[Unit]
+Description=Запуск Torrent Blocker каждые 15 секунд
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=torrent-blocker.service
+
+[Install]
+WantedBy=timers.target

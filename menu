@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/torrent-blocker"
+ENV_FILE="${APP_DIR}/.env"
+APP_SCRIPT="${APP_DIR}/torrent-blocker"
+LAST_ID_FILE="${APP_DIR}/last_id"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Запусти меню от root"
+  exit 1
+fi
+
+set_env() {
+  local key="$1"
+  local value="$2"
+  local tmp
+
+  tmp="$(mktemp)"
+
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    awk -v k="$key" -v v="$value" '
+      BEGIN { q = sprintf("%c", 34) }
+      $0 ~ "^" k "=" { $0 = k "=" q v q }
+      { print }
+    ' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    echo "${key}=\"${value}\"" >> "$tmp"
+  fi
+
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+get_env() {
+  local key="$1"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    grep "^${key}=" "$ENV_FILE" | head -n1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true
+  fi
+}
+
+pause() {
+  echo
+  read -rp "Нажми Enter..."
+}
+
+blocker_state() {
+  if systemctl is-active --quiet torrent-blocker.timer; then
+    echo "ВКЛ"
+  else
+    echo "ВЫКЛ"
+  fi
+}
+
+telegram_state() {
+  if [[ "$(get_env TELEGRAM_ENABLED)" == "true" ]]; then
+    echo "ВКЛ"
+  else
+    echo "ВЫКЛ"
+  fi
+}
+
+toggle_blocker() {
+  if systemctl is-active --quiet torrent-blocker.timer; then
+    systemctl disable --now torrent-blocker.timer
+    echo "ОК: Torrent Blocker отключён"
+  else
+    systemctl enable --now torrent-blocker.timer
+    echo "ОК: Torrent Blocker включён"
+  fi
+}
+
+show_status() {
+  echo
+  echo "╭────────────────────────────────────╮"
+  echo "│ Статус Torrent Blocker             │"
+  echo "╰────────────────────────────────────╯"
+  echo
+  echo "Сервис:      $(blocker_state)"
+  echo "Telegram:    $(telegram_state)"
+  echo "Admin ID:    $(get_env TELEGRAM_ADMIN_ID)"
+  echo "Ban timeout: $(get_env BAN_TIMEOUT)"
+  echo "Page size:   $(get_env PAGE_SIZE)"
+  echo "Max pages:   $(get_env MAX_PAGES)"
+  echo
+  echo -n "Last ID:     "
+  if [[ -f "$LAST_ID_FILE" ]]; then
+    cat "$LAST_ID_FILE"
+  else
+    echo "не найден"
+  fi
+
+  echo
+  systemctl --no-pager --plain status torrent-blocker.timer | sed -n '1,8p' || true
+}
+
+run_once() {
+  "$APP_SCRIPT"
+}
+
+show_logs() {
+  journalctl -u torrent-blocker.service -n 80 --no-pager
+}
+
+show_banned() {
+  nft list set inet torrent_guard blocked_ipv4 || true
+}
+
+edit_config() {
+  nano "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+telegram_setup() {
+  echo
+  echo "Настройка Telegram"
+  echo
+
+  read -rp "Telegram Bot Token: " BOT_TOKEN
+  read -rp "Telegram Admin ID: " ADMIN_ID
+
+  if [[ -z "$BOT_TOKEN" || -z "$ADMIN_ID" ]]; then
+    echo "Ошибка: токен и admin id не должны быть пустыми"
+    return 1
+  fi
+
+  set_env "TELEGRAM_BOT_TOKEN" "$BOT_TOKEN"
+  set_env "TELEGRAM_ADMIN_ID" "$ADMIN_ID"
+  set_env "TELEGRAM_ENABLED" "true"
+
+  echo
+  echo "ОК: Telegram настроен и включён"
+}
+
+telegram_toggle() {
+  if [[ "$(get_env TELEGRAM_ENABLED)" == "true" ]]; then
+    set_env "TELEGRAM_ENABLED" "false"
+    echo "ОК: Telegram-уведомления отключены"
+  else
+    set_env "TELEGRAM_ENABLED" "true"
+    echo "ОК: Telegram-уведомления включены"
+  fi
+}
+
+telegram_test() {
+  set -a
+  source "$ENV_FILE"
+  set +a
+
+  if [[ "${TELEGRAM_ENABLED:-false}" != "true" ]]; then
+    echo "Telegram выключен. Сначала включи его."
+    return 1
+  fi
+
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_ADMIN_ID:-}" ]]; then
+    echo "Не задан TELEGRAM_BOT_TOKEN или TELEGRAM_ADMIN_ID"
+    return 1
+  fi
+
+  curl -fsS \
+    --connect-timeout 10 \
+    --max-time 15 \
+    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_ADMIN_ID}" \
+    --data-urlencode "text=✅ Torrent Blocker: тестовое уведомление. Сообщения отправляются только admin id." \
+    -d "disable_web_page_preview=true" \
+    >/dev/null
+
+  echo "ОК: тестовое уведомление отправлено"
+}
+
+telegram_menu() {
+  while true; do
+    clear
+    echo "╭────────────────────────────────────╮"
+    echo "│ Telegram уведомления               │"
+    echo "╰────────────────────────────────────╯"
+    echo
+    echo "Статус:   $(telegram_state)"
+    echo "Admin ID: $(get_env TELEGRAM_ADMIN_ID)"
+    echo
+    echo "1) Настроить Telegram"
+    echo "2) Включить / отключить"
+    echo "3) Отправить тест"
+    echo "0) Назад"
+    echo
+    read -rp "Выбор: " CHOICE
+
+    case "$CHOICE" in
+      1) telegram_setup; pause ;;
+      2) telegram_toggle; pause ;;
+      3) telegram_test; pause ;;
+      0) return ;;
+      *) echo "Неверный пункт"; pause ;;
+    esac
+  done
+}
+
+main_menu() {
+  while true; do
+    clear
+    echo "╭────────────────────────────────────╮"
+    echo "│        Torrent Blocker             │"
+    echo "╰────────────────────────────────────╯"
+    echo
+    echo "Сервис:   $(blocker_state)"
+    echo "Telegram: $(telegram_state)"
+    echo
+    echo "1) Включить / отключить"
+    echo "2) Проверить сейчас"
+    echo "3) Статус"
+    echo "4) Заблокированные IP"
+    echo "5) Логи"
+    echo "6) Telegram"
+    echo "7) Конфиг"
+    echo "0) Выход"
+    echo
+    read -rp "Выбор: " CHOICE
+
+    case "$CHOICE" in
+      1) toggle_blocker; pause ;;
+      2) run_once; pause ;;
+      3) show_status; pause ;;
+      4) show_banned; pause ;;
+      5) show_logs; pause ;;
+      6) telegram_menu ;;
+      7) edit_config; pause ;;
+      0) exit 0 ;;
+      *) echo "Неверный пункт"; pause ;;
+    esac
+  done
+}
+
+main_menu

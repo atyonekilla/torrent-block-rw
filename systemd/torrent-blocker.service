@@ -1,0 +1,9 @@
+[Unit]
+Description=Torrent Blocker - опрос Remnawave reports и локальная блокировка IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/torrent-blocker
+ExecStart=/opt/torrent-blocker/torrent-blocker
