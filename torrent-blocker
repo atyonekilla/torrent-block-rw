@@ -25,6 +25,19 @@ if [[ ! -d "$APP_DIR" ]]; then
   exit 1
 fi
 
+default_ingress_node_name() {
+  local host_name ip_address
+
+  host_name="$(hostname 2>/dev/null || echo "unknown-host")"
+  read -r ip_address _ < <(hostname -I 2>/dev/null || true)
+
+  if [[ -n "${ip_address:-}" ]]; then
+    echo "${host_name} (${ip_address})"
+  else
+    echo "$host_name"
+  fi
+}
+
 exec 9>"$LOCK_FILE"
 
 if ! flock -n 9; then
@@ -44,10 +57,13 @@ set +a
 BAN_TIMEOUT="${BAN_TIMEOUT:-1h}"
 PAGE_SIZE="${PAGE_SIZE:-100}"
 MAX_PAGES="${MAX_PAGES:-5}"
+INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$(default_ingress_node_name)}"
 
 TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_ADMIN_ID="${TELEGRAM_ADMIN_ID:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_ADMIN_ID}}"
+TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
 
 if [[ -z "${REMNAWAVE_API_BASE:-}" ]]; then
   echo "Ошибка: REMNAWAVE_API_BASE не задан"
@@ -76,6 +92,11 @@ fi
 
 if [[ "$TELEGRAM_ENABLED" != "true" && "$TELEGRAM_ENABLED" != "false" ]]; then
   echo "Ошибка: TELEGRAM_ENABLED должен быть true или false"
+  exit 1
+fi
+
+if [[ -n "$TELEGRAM_TOPIC_ID" && ! "$TELEGRAM_TOPIC_ID" =~ ^[0-9]+$ ]]; then
+  echo "Ошибка: TELEGRAM_TOPIC_ID должен быть числом"
   exit 1
 fi
 
@@ -126,29 +147,60 @@ safe_value() {
   fi
 }
 
+format_timestamp() {
+  local value="${1:-}"
+
+  if [[ -z "$value" || "$value" == "null" || "$value" == "-" ]]; then
+    echo "-"
+    return 0
+  fi
+
+  date -u -d "$value" "+%d.%m.%Y %H:%M:%S UTC" 2>/dev/null || echo "$value"
+}
+
+html_escape() {
+  local value="${1:-}"
+
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+
+  echo "$value"
+}
+
 send_telegram() {
   local text="$1"
+  local -a curl_args
 
   if [[ "$TELEGRAM_ENABLED" != "true" ]]; then
     return 0
   fi
 
-  if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_ADMIN_ID" ]]; then
-    logger -t torrent-blocker "telegram=skip reason=empty_token_or_admin_id"
+  if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+    logger -t torrent-blocker "telegram=skip reason=empty_token_or_chat_id"
     return 0
   fi
 
-  curl -fsS \
-    --connect-timeout 10 \
-    --max-time 15 \
-    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_ADMIN_ID}" \
-    --data-urlencode "text=${text}" \
-    -d "disable_web_page_preview=true" \
-    >/dev/null 2>&1 || {
-      logger -t torrent-blocker "telegram=failed"
-      return 0
-    }
+  curl_args=(
+    -fsS
+    --connect-timeout 10
+    --max-time 15
+    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+    -d "chat_id=${TELEGRAM_CHAT_ID}"
+    --data-urlencode "text=${text}"
+    -d "parse_mode=HTML"
+    -d "disable_web_page_preview=true"
+  )
+
+  if [[ -n "$TELEGRAM_TOPIC_ID" ]]; then
+    curl_args+=(-d "message_thread_id=${TELEGRAM_TOPIC_ID}")
+  fi
+
+  curl "${curl_args[@]}" >/dev/null 2>&1 || {
+    logger -t torrent-blocker "telegram=failed"
+    return 0
+  }
 }
 
 ban_ip() {
@@ -259,8 +311,21 @@ for (( PAGE=0; PAGE<MAX_PAGES; PAGE++ )); do
     PROTOCOL="$(safe_value "$PROTOCOL")"
     OUTBOUND_TAG="$(safe_value "$OUTBOUND_TAG")"
     CREATED_AT="$(safe_value "$CREATED_AT")"
+    CREATED_AT_FORMATTED="$(format_timestamp "$CREATED_AT")"
+
+    TG_INGRESS_NODE_NAME="$(html_escape "$INGRESS_NODE_NAME")"
+    TG_CLIENT_IP="$(html_escape "$CLIENT_IP")"
+    TG_BAN_TIMEOUT="$(html_escape "$BAN_TIMEOUT")"
+    TG_ID="$(html_escape "$ID")"
+    TG_USER_ID="$(html_escape "$USER_ID")"
+    TG_USERNAME="$(html_escape "$USERNAME")"
+    TG_USER_UUID="$(html_escape "$USER_UUID")"
+    TG_NODE_NAME="$(html_escape "$NODE_NAME")"
+    TG_NODE_COUNTRY="$(html_escape "$NODE_COUNTRY")"
+    TG_CREATED_AT_FORMATTED="$(html_escape "$CREATED_AT_FORMATTED")"
 
     echo "Найден torrent-report:"
+    echo "  Входная нода:    $INGRESS_NODE_NAME"
     echo "  ID report:       $ID"
     echo "  ID пользователя: $USER_ID"
     echo "  Логин:           $USERNAME"
@@ -270,30 +335,34 @@ for (( PAGE=0; PAGE<MAX_PAGES; PAGE++ )); do
     echo "  Страна ноды:     $NODE_COUNTRY"
     echo "  Протокол:        $PROTOCOL"
     echo "  Outbound:        $OUTBOUND_TAG"
-    echo "  Создан:          $CREATED_AT"
+    echo "  Создан:          $CREATED_AT_FORMATTED"
 
     ban_ip "$CLIENT_IP" "$BAN_TIMEOUT"
 
-    TELEGRAM_TEXT="🚫 Торрент заблокирован
+    TELEGRAM_TEXT="<b>🚫 Торрент заблокирован</b>
 
-IP клиента: ${CLIENT_IP}
-Время блокировки: ${BAN_TIMEOUT}
+<b>🖥 Сервер</b>
+• Входная нода: <code>${TG_INGRESS_NODE_NAME}</code>
 
-ID report: ${ID}
-ID пользователя: ${USER_ID}
-Логин: ${USERNAME}
-UUID: ${USER_UUID}
+<b>⛔ Блокировка</b>
+• IP клиента: <code>${TG_CLIENT_IP}</code>
+• Срок: <code>${TG_BAN_TIMEOUT}</code>
 
-Нода: ${NODE_NAME}
-Страна ноды: ${NODE_COUNTRY}
-Протокол: ${PROTOCOL}
-Outbound: ${OUTBOUND_TAG}
-Создан: ${CREATED_AT}"
+<b>👤 Пользователь</b>
+• ID: <code>${TG_USER_ID}</code>
+• Логин: <code>${TG_USERNAME}</code>
+• UUID: <code>${TG_USER_UUID}</code>
+
+<b>📄 Report</b>
+• ID: <code>${TG_ID}</code>
+• Нода: <code>${TG_NODE_NAME}</code>
+• Страна: <code>${TG_NODE_COUNTRY}</code>
+• Создан: <code>${TG_CREATED_AT_FORMATTED}</code>"
 
     send_telegram "$TELEGRAM_TEXT"
 
     logger -t torrent-blocker \
-      "report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован"
+      "ingress_node=$INGRESS_NODE_NAME report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован"
 
     PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
 

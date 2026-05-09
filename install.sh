@@ -3,12 +3,81 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="/opt/torrent-blocker"
+ENV_FILE="${APP_DIR}/.env"
 
 SERVICE_SRC="${PROJECT_DIR}/systemd/torrent-blocker.service"
 TIMER_SRC="${PROJECT_DIR}/systemd/torrent-blocker.timer"
 
 SERVICE_DST="/etc/systemd/system/torrent-blocker.service"
 TIMER_DST="/etc/systemd/system/torrent-blocker.timer"
+
+default_ingress_node_name() {
+  local host_name public_ip local_ip
+
+  host_name="$(hostname 2>/dev/null || echo "unknown-host")"
+  public_ip="$(curl -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+
+  if [[ -z "$public_ip" ]]; then
+    read -r local_ip _ < <(hostname -I 2>/dev/null || true)
+  fi
+
+  if [[ -n "$public_ip" ]]; then
+    echo "${host_name} (${public_ip})"
+  elif [[ -n "${local_ip:-}" ]]; then
+    echo "${host_name} (${local_ip})"
+  else
+    echo "$host_name"
+  fi
+}
+
+escape_env_value() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+
+  echo "$value"
+}
+
+set_env() {
+  local key="$1"
+  local value="$2"
+  local escaped_value
+  local tmp
+
+  escaped_value="$(escape_env_value "$value")"
+  tmp="$(mktemp)"
+
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    awk -v k="$key" -v v="$escaped_value" '
+      BEGIN { q = sprintf("%c", 34) }
+      $0 ~ "^" k "=" { $0 = k "=" q v q }
+      { print }
+    ' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    echo "${key}=\"${escaped_value}\"" >> "$tmp"
+  fi
+
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+get_env() {
+  local key="$1"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    grep "^${key}=" "$ENV_FILE" | head -n1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true
+  fi
+}
+
+ask_ingress_node_name() {
+  local default_name
+
+  default_name="$(default_ingress_node_name)"
+  read -rp "Имя входной ноды [${default_name}]: " INGRESS_NODE_NAME
+  INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$default_name}"
+}
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Ошибка: установку нужно запускать от root"
@@ -81,9 +150,13 @@ if [[ ! -f "${APP_DIR}/.env" ]]; then
     exit 1
   fi
 
-  cat > "${APP_DIR}/.env" <<EOF
+  ask_ingress_node_name
+
+  cat > "$ENV_FILE" <<EOF
 REMNAWAVE_API_BASE="${REMNAWAVE_API_BASE%/}"
 REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN}"
+
+INGRESS_NODE_NAME="$(escape_env_value "$INGRESS_NODE_NAME")"
 
 BAN_TIMEOUT="${BAN_TIMEOUT}"
 PAGE_SIZE="100"
@@ -91,12 +164,20 @@ MAX_PAGES="5"
 
 TELEGRAM_ENABLED="false"
 TELEGRAM_BOT_TOKEN=""
-TELEGRAM_ADMIN_ID=""
+TELEGRAM_CHAT_ID=""
+TELEGRAM_TOPIC_ID=""
 EOF
 
-  chmod 600 "${APP_DIR}/.env"
+  chmod 600 "$ENV_FILE"
 else
-  echo "Файл ${APP_DIR}/.env уже существует, не перезаписываю"
+  echo "Файл $ENV_FILE уже существует, не перезаписываю"
+
+  if [[ -z "$(get_env INGRESS_NODE_NAME)" ]]; then
+    echo
+    echo "В конфиге не задано имя входной ноды."
+    ask_ingress_node_name
+    set_env "INGRESS_NODE_NAME" "$INGRESS_NODE_NAME"
+  fi
 fi
 
 touch "${APP_DIR}/last_id"

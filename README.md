@@ -45,7 +45,8 @@ nft add element inet torrent_guard blocked_ipv4 "{ 46.173.35.204 timeout 1h }"
 - Обработка только новых reports через `last_id`
 - Systemd timer для регулярного запуска
 - Компактное CLI-меню
-- Telegram-уведомления только на указанный admin ID
+- Метка входной ноды для схем с несколькими входными серверами
+- Telegram-уведомления в личку, чат или нужный топик Telegram
 - Простая установка через `install.sh`
 
 ---
@@ -142,6 +143,7 @@ sudo bash install.sh
 ```text
 Remnawave API URL
 Remnawave API token
+Имя входной ноды
 Время блокировки IP
 Пропускать ли старые reports
 ```
@@ -150,9 +152,12 @@ Remnawave API token
 
 ```text
 Remnawave API URL: https://admin.example.com
+Имя входной ноды: gateway-1 (203.0.113.10)
 Время блокировки: 1h
 Пропустить старые reports: Y
 ```
+
+Если имя входной ноды оставить пустым, установщик подставит дефолт вида `hostname (ip)`.
 
 Рекомендуется пропустить старые reports, чтобы скрипт начал блокировать только новые нарушения.
 
@@ -225,14 +230,16 @@ sudo nano /opt/torrent-blocker/.env
 REMNAWAVE_API_BASE="https://admin.example.com"
 REMNAWAVE_API_TOKEN="PASTE_YOUR_REMNAWAVE_API_TOKEN_HERE"
 
+INGRESS_NODE_NAME="gateway-1 (203.0.113.10)"
+
 BAN_TIMEOUT="1h"
 PAGE_SIZE="100"
 MAX_PAGES="5"
 
 TELEGRAM_ENABLED="false"
 TELEGRAM_BOT_TOKEN=""
-TELEGRAM_ADMIN_ID=""
-```
+TELEGRAM_CHAT_ID=""
+TELEGRAM_TOPIC_ID=""
 ```
 
 После изменения `.env` перезапускать timer не нужно — конфиг читается при каждом запуске.
@@ -244,12 +251,15 @@ TELEGRAM_ADMIN_ID=""
 |---|---|
 | `REMNAWAVE_API_BASE` | URL панели Remnawave |
 | `REMNAWAVE_API_TOKEN` | API-токен Remnawave |
+| `INGRESS_NODE_NAME` | Имя входной ноды/сервера, которое будет видно в логах и Telegram-алертах |
 | `BAN_TIMEOUT` | Время блокировки IP |
 | `PAGE_SIZE` | Количество reports за один запрос |
 | `MAX_PAGES` | Максимум страниц за один запуск |
 | `TELEGRAM_ENABLED` | Включены ли Telegram-уведомления |
 | `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота |
-| `TELEGRAM_ADMIN_ID` | ID администратора, которому отправлять уведомления |
+| `TELEGRAM_CHAT_ID` | ID личного чата, группы или супергруппы, куда отправлять уведомления |
+| `TELEGRAM_TOPIC_ID` | ID топика (`message_thread_id`) внутри Telegram-группы. Оставь пустым, если топик не нужен |
+| `TELEGRAM_ADMIN_ID` | Старое имя для личного `chat_id`; поддерживается как fallback для существующих конфигов |
 
 ---
 
@@ -317,27 +327,48 @@ Telegram: ВЫКЛ
 0) Назад
 ```
 
+При настройке можно указать:
+
+```text
+Telegram Chat ID: -1001234567890
+Telegram Topic ID / message_thread_id: 42
+```
+
+`TELEGRAM_CHAT_ID` — это цель отправки: личный чат, группа или супергруппа. Для отправки в топик добавь бота в группу, отправь любое сообщение в нужный топик и укажи `message_thread_id` как `TELEGRAM_TOPIC_ID`. Если топик не нужен, оставь `TELEGRAM_TOPIC_ID` пустым.
+
+Chat ID и Topic ID можно взять из Bot API:
+
+```text
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates
+```
+
+Нужные поля в ответе: `message.chat.id` и, для топика, `message.message_thread_id`.
+
 При блокировке IP придёт сообщение:
 
 ```text
 🚫 Торрент заблокирован
 
-IP клиента: 46.173.35.204
-Время блокировки: 1h
+🖥 Сервер
+• Входная нода: gateway-1 (203.0.113.10)
 
-ID report: 678
-ID пользователя: 1701
-Логин: 1701
-UUID: ...
+⛔ Блокировка
+• IP клиента: 46.173.35.204
+• Срок: 1h
 
-Нода: poland
-Страна ноды: PL
-Протокол: bittorrent
-Outbound: RW_TB_OUTBOUND_BLOCK
-Создан: 2026-05-09T...
+👤 Пользователь
+• ID: 1701
+• Логин: 1701
+• UUID: ...
+
+📄 Report
+• ID: 678
+• Нода: poland
+• Страна: PL
+• Создан: 09.05.2026 16:46:00 UTC
 ```
 
-Уведомления отправляются только на указанный `TELEGRAM_ADMIN_ID`.
+Уведомления отправляются на `TELEGRAM_CHAT_ID`. Если в старом конфиге задан только `TELEGRAM_ADMIN_ID`, он будет использован как `chat_id`.
 
 ---
 
