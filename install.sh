@@ -92,12 +92,12 @@ configure_instance() {
     APP_DIR="/opt/torrent-blocker"
     SERVICE_UNIT="torrent-blocker.service"
     TIMER_UNIT="torrent-blocker.timer"
-    MENU_BIN="/usr/local/bin/torrent-blocker-menu"
+    MENU_BIN="/usr/local/bin/torrent-blocker"
   else
     APP_DIR="/opt/torrent-blocker-${INSTANCE_NAME}"
     SERVICE_UNIT="torrent-blocker-${INSTANCE_NAME}.service"
     TIMER_UNIT="torrent-blocker-${INSTANCE_NAME}.timer"
-    MENU_BIN="/usr/local/bin/torrent-blocker-${INSTANCE_NAME}-menu"
+    MENU_BIN="/usr/local/bin/torrent-blocker-${INSTANCE_NAME}"
   fi
 
   ENV_FILE="${APP_DIR}/.env"
@@ -165,25 +165,6 @@ get_env() {
   fi
 }
 
-ask_ingress_node_name() {
-  local default_name
-
-  default_name="$(default_ingress_node_name)"
-  INGRESS_NODE_NAME="$(prompt_input "Имя входной ноды [${default_name}]: ")"
-  INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$default_name}"
-}
-
-html_escape() {
-  local value="${1:-}"
-
-  value="${value//&/&amp;}"
-  value="${value//</&lt;}"
-  value="${value//>/&gt;}"
-  value="${value//\"/&quot;}"
-
-  echo "$value"
-}
-
 load_env() {
   set -a
   source "$ENV_FILE"
@@ -192,18 +173,12 @@ load_env() {
   INSTANCE_NAME="${INSTANCE_NAME:-default}"
   SERVICE_UNIT="${SERVICE_UNIT:-torrent-blocker.service}"
   TIMER_UNIT="${TIMER_UNIT:-torrent-blocker.timer}"
-  MENU_BIN="${MENU_BIN:-/usr/local/bin/torrent-blocker-menu}"
+  MENU_BIN="${MENU_BIN:-/usr/local/bin/torrent-blocker}"
 
   BAN_TIMEOUT="${BAN_TIMEOUT:-1h}"
   PAGE_SIZE="${PAGE_SIZE:-100}"
   MAX_PAGES="${MAX_PAGES:-5}"
   INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$(default_ingress_node_name)}"
-
-  TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-false}"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-  TELEGRAM_ADMIN_ID="${TELEGRAM_ADMIN_ID:-}"
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_ADMIN_ID}}"
-  TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
 }
 
 fetch_remnawave_reports() {
@@ -327,13 +302,7 @@ collect_new_config() {
 
   PAGE_SIZE="100"
   MAX_PAGES="5"
-
-  ask_ingress_node_name
-
-  TELEGRAM_ENABLED="false"
-  TELEGRAM_BOT_TOKEN=""
-  TELEGRAM_CHAT_ID=""
-  TELEGRAM_TOPIC_ID=""
+  INGRESS_NODE_NAME="$(default_ingress_node_name)"
 }
 
 write_env_file() {
@@ -351,11 +320,6 @@ INGRESS_NODE_NAME="$(escape_env_value "$INGRESS_NODE_NAME")"
 BAN_TIMEOUT="${BAN_TIMEOUT}"
 PAGE_SIZE="${PAGE_SIZE:-100}"
 MAX_PAGES="${MAX_PAGES:-5}"
-
-TELEGRAM_ENABLED="${TELEGRAM_ENABLED}"
-TELEGRAM_BOT_TOKEN="$(escape_env_value "$TELEGRAM_BOT_TOKEN")"
-TELEGRAM_CHAT_ID="$(escape_env_value "$TELEGRAM_CHAT_ID")"
-TELEGRAM_TOPIC_ID="$(escape_env_value "$TELEGRAM_TOPIC_ID")"
 EOF
 
   chmod 600 "$ENV_FILE"
@@ -394,7 +358,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=${APP_DIR}
-ExecStart=${APP_DIR}/torrent-blocker
+ExecStart=${APP_DIR}/torrent-blocker --run
 EOF
 
   cat > "$TIMER_DST" <<EOF
@@ -410,6 +374,21 @@ Unit=${SERVICE_UNIT}
 [Install]
 WantedBy=timers.target
 EOF
+}
+
+write_menu_command() {
+  cat > "$MENU_BIN" <<EOF
+#!/usr/bin/env bash
+exec "${APP_DIR}/torrent-blocker" --menu "\$@"
+EOF
+
+  chmod 755 "$MENU_BIN"
+
+  if [[ "$INSTANCE_NAME" == "default" ]]; then
+    rm -f /usr/local/bin/torrent-blocker-menu
+  else
+    rm -f "/usr/local/bin/torrent-blocker-${INSTANCE_NAME}-menu"
+  fi
 }
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -434,6 +413,7 @@ if [[ -f "${APP_DIR}/.env" ]]; then
   HAS_EXISTING_ENV="true"
   echo "Файл $ENV_FILE уже существует, не перезаписываю"
   load_env
+  configure_instance
   check_remnawave_panel
 else
   collect_new_config
@@ -462,9 +442,7 @@ else
   set_env "MENU_BIN" "$MENU_BIN"
 
   if [[ -z "$(get_env INGRESS_NODE_NAME)" ]]; then
-    echo
-    echo "В конфиге не задано имя входной ноды."
-    ask_ingress_node_name
+    INGRESS_NODE_NAME="$(default_ingress_node_name)"
     set_env "INGRESS_NODE_NAME" "$INGRESS_NODE_NAME"
   fi
 fi
@@ -476,29 +454,21 @@ chmod 600 "${APP_DIR}/last_id"
 
 if [[ ! -s "${APP_DIR}/last_id" ]]; then
   echo
-  SKIP_OLD="$(prompt_input "Пропустить старые torrent reports? [Y/n]: ")"
-  SKIP_OLD="${SKIP_OLD:-Y}"
+  set -a
+  source "${APP_DIR}/.env"
+  set +a
 
-  if [[ "$SKIP_OLD" =~ ^[YyДд]$ ]]; then
-    set -a
-    source "${APP_DIR}/.env"
-    set +a
+  echo "Получение текущего последнего report id..."
 
-    echo "Получение текущего последнего report id..."
+  if ! CURRENT_MAX_ID="$(fetch_remnawave_reports 100 0 | jq -r '[.response.records[]?.id // 0] | max // 0')"; then
 
-    if ! CURRENT_MAX_ID="$(fetch_remnawave_reports 100 0 | jq -r '[.response.records[]?.id // 0] | max // 0')"; then
-
-      echo "Ошибка: не удалось получить reports из Remnawave API"
-      echo "Проверь URL панели и API-токен"
-      exit 1
-    fi
-
-    echo "${CURRENT_MAX_ID}" > "${APP_DIR}/last_id"
-    echo "Старые reports пропущены. last_id=${CURRENT_MAX_ID}"
-  else
-    echo "0" > "${APP_DIR}/last_id"
-    echo "Старые reports будут обработаны с id > 0"
+    echo "Ошибка: не удалось получить reports из Remnawave API"
+    echo "Проверь URL панели и API-токен"
+    exit 1
   fi
+
+  echo "${CURRENT_MAX_ID}" > "${APP_DIR}/last_id"
+  echo "Старые reports пропущены. last_id=${CURRENT_MAX_ID}"
 fi
 
 echo
@@ -516,8 +486,7 @@ echo
 echo "Установка systemd..."
 
 write_systemd_units
-
-ln -sf "${APP_DIR}/torrent-blocker" "$MENU_BIN"
+write_menu_command
 
 systemctl daemon-reload
 systemctl enable --now "$TIMER_UNIT"
@@ -532,7 +501,7 @@ echo
 echo "Команды:"
 echo "  ${MENU_BIN##*/}                                  - меню управления"
 echo "  ${APP_DIR}/torrent-blocker --menu                - меню напрямую"
-echo "  ${APP_DIR}/torrent-blocker                       - проверка сейчас"
+echo "  ${APP_DIR}/torrent-blocker --run                 - проверка сейчас"
 echo "  systemctl status ${TIMER_UNIT} --no-pager        - статус таймера"
 echo "  journalctl -u ${SERVICE_UNIT} -n 100 --no-pager  - последние логи"
 echo "  nft list set inet torrent_guard blocked_ipv4     - заблокированные IP"

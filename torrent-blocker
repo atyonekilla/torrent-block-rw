@@ -71,18 +71,12 @@ load_runtime_config() {
   INSTANCE_NAME="${INSTANCE_NAME:-default}"
   SERVICE_UNIT="${SERVICE_UNIT:-torrent-blocker.service}"
   TIMER_UNIT="${TIMER_UNIT:-torrent-blocker.timer}"
-  MENU_BIN="${MENU_BIN:-/usr/local/bin/torrent-blocker-menu}"
+  MENU_BIN="${MENU_BIN:-/usr/local/bin/torrent-blocker}"
 
   BAN_TIMEOUT="${BAN_TIMEOUT:-1h}"
   PAGE_SIZE="${PAGE_SIZE:-100}"
   MAX_PAGES="${MAX_PAGES:-5}"
   INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$(default_ingress_node_name)}"
-
-  TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-false}"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-  TELEGRAM_ADMIN_ID="${TELEGRAM_ADMIN_ID:-}"
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_ADMIN_ID}}"
-  TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
 
   if ! [[ "$BAN_TIMEOUT" =~ ^[0-9]+[smhd]$ ]]; then
     echo "Ошибка: BAN_TIMEOUT должен быть в формате 30s, 30m, 1h или 1d"
@@ -99,15 +93,6 @@ load_runtime_config() {
     exit 1
   fi
 
-  if [[ "$TELEGRAM_ENABLED" != "true" && "$TELEGRAM_ENABLED" != "false" ]]; then
-    echo "Ошибка: TELEGRAM_ENABLED должен быть true или false"
-    exit 1
-  fi
-
-  if [[ -n "$TELEGRAM_TOPIC_ID" && ! "$TELEGRAM_TOPIC_ID" =~ ^[0-9]+$ ]]; then
-    echo "Ошибка: TELEGRAM_TOPIC_ID должен быть числом"
-    exit 1
-  fi
 }
 
 require_api_config() {
@@ -180,51 +165,6 @@ format_timestamp() {
   fi
 
   date -u -d "$value" "+%d.%m.%Y %H:%M:%S UTC" 2>/dev/null || echo "$value"
-}
-
-html_escape() {
-  local value="${1:-}"
-
-  value="${value//&/&amp;}"
-  value="${value//</&lt;}"
-  value="${value//>/&gt;}"
-  value="${value//\"/&quot;}"
-
-  echo "$value"
-}
-
-send_telegram() {
-  local text="$1"
-  local -a curl_args
-
-  if [[ "$TELEGRAM_ENABLED" != "true" ]]; then
-    return 0
-  fi
-
-  if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-    logger -t torrent-blocker "telegram=skip reason=empty_token_or_chat_id"
-    return 0
-  fi
-
-  curl_args=(
-    -fsS
-    --connect-timeout 10
-    --max-time 15
-    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    -d "chat_id=${TELEGRAM_CHAT_ID}"
-    --data-urlencode "text=${text}"
-    -d "parse_mode=HTML"
-    -d "disable_web_page_preview=true"
-  )
-
-  if [[ -n "$TELEGRAM_TOPIC_ID" ]]; then
-    curl_args+=(-d "message_thread_id=${TELEGRAM_TOPIC_ID}")
-  fi
-
-  curl "${curl_args[@]}" >/dev/null 2>&1 || {
-    logger -t torrent-blocker "telegram=failed"
-    return 0
-  }
 }
 
 ban_ip() {
@@ -310,28 +250,6 @@ require_menu_root() {
   fi
 }
 
-set_env() {
-  local key="$1"
-  local value="$2"
-  local tmp
-
-  tmp="$(mktemp)"
-
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    awk -v k="$key" -v v="$value" '
-      BEGIN { q = sprintf("%c", 34) }
-      $0 ~ "^" k "=" { $0 = k "=" q v q }
-      { print }
-    ' "$ENV_FILE" > "$tmp"
-  else
-    cat "$ENV_FILE" > "$tmp"
-    echo "${key}=\"${value}\"" >> "$tmp"
-  fi
-
-  mv "$tmp" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-}
-
 escape_env_value() {
   local value="${1:-}"
 
@@ -374,30 +292,6 @@ blocker_state() {
   else
     echo "ВЫКЛ"
   fi
-}
-
-telegram_state() {
-  if [[ "$(get_env TELEGRAM_ENABLED)" == "true" ]]; then
-    echo "ВКЛ"
-  else
-    echo "ВЫКЛ"
-  fi
-}
-
-telegram_chat_id() {
-  local chat_id
-
-  chat_id="$(get_env TELEGRAM_CHAT_ID)"
-
-  if [[ -z "$chat_id" ]]; then
-    chat_id="$(get_env TELEGRAM_ADMIN_ID)"
-  fi
-
-  echo "$chat_id"
-}
-
-telegram_topic_id() {
-  get_env TELEGRAM_TOPIC_ID
 }
 
 ingress_node_name() {
@@ -445,9 +339,6 @@ show_status() {
   echo "Установка:   $(display_value "$(get_env INSTANCE_NAME)")"
   echo "Сервис:      $(blocker_state)"
   echo "Входная нода: $(display_value "$(ingress_node_name)")"
-  echo "Telegram:    $(telegram_state)"
-  echo "Chat ID:     $(display_value "$(telegram_chat_id)")"
-  echo "Topic ID:    $(display_value "$(telegram_topic_id)")"
   echo "Ban timeout: $(get_env BAN_TIMEOUT)"
   echo "Page size:   $(get_env PAGE_SIZE)"
   echo "Max pages:   $(get_env MAX_PAGES)"
@@ -478,185 +369,6 @@ show_banned() {
 edit_config() {
   nano "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-}
-
-normalize_telegram_chat_id() {
-  local chat_id="$1"
-
-  chat_id="${chat_id//[[:space:]]/}"
-
-  if [[ -z "$chat_id" ]]; then
-    echo ""
-    return 0
-  fi
-
-  if [[ "$chat_id" =~ ^-100[0-9]+$ ]]; then
-    echo "$chat_id"
-    return 0
-  fi
-
-  if [[ "$chat_id" =~ ^[0-9]+$ ]]; then
-    echo "-100${chat_id}"
-    return 0
-  fi
-
-  if [[ "$chat_id" =~ ^-[0-9]+$ || "$chat_id" =~ ^@[A-Za-z0-9_]+$ ]]; then
-    echo "$chat_id"
-    return 0
-  fi
-
-  return 1
-}
-
-telegram_setup() {
-  local CURRENT_BOT_TOKEN CURRENT_CHAT_ID CURRENT_TOPIC_ID
-  local BOT_TOKEN CHAT_ID TOPIC_ID INPUT_CHAT_ID
-
-  echo
-  echo "Настройка Telegram"
-  echo
-  echo "Для группы или топика добавь бота в чат и отправь сообщение в нужный топик."
-  echo "Затем укажи chat id группы и topic id/message_thread_id топика."
-  echo
-
-  CURRENT_BOT_TOKEN="$(get_env TELEGRAM_BOT_TOKEN)"
-  CURRENT_CHAT_ID="$(telegram_chat_id)"
-  CURRENT_TOPIC_ID="$(telegram_topic_id)"
-
-  read -rp "Telegram Bot Token${CURRENT_BOT_TOKEN:+ [оставить текущий]}: " BOT_TOKEN
-  BOT_TOKEN="${BOT_TOKEN:-$CURRENT_BOT_TOKEN}"
-
-  read -rp "Telegram Chat ID${CURRENT_CHAT_ID:+ [$CURRENT_CHAT_ID]}: " INPUT_CHAT_ID
-  CHAT_ID="${INPUT_CHAT_ID:-$CURRENT_CHAT_ID}"
-
-  read -rp "Telegram Topic ID / message_thread_id${CURRENT_TOPIC_ID:+ [$CURRENT_TOPIC_ID]} (Enter оставить, '-' очистить): " TOPIC_ID
-
-  if [[ "$TOPIC_ID" == "-" ]]; then
-    TOPIC_ID=""
-  elif [[ -z "$TOPIC_ID" ]]; then
-    TOPIC_ID="$CURRENT_TOPIC_ID"
-  fi
-
-  if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
-    echo "Ошибка: токен и chat id не должны быть пустыми"
-    return 1
-  fi
-
-  if ! CHAT_ID="$(normalize_telegram_chat_id "$CHAT_ID")"; then
-    echo "Ошибка: Telegram Chat ID должен быть числом, -100..., -... или @username"
-    return 1
-  fi
-
-  if [[ "$INPUT_CHAT_ID" =~ ^[0-9]+$ ]]; then
-    echo "Telegram Chat ID приведён к формату -100: ${CHAT_ID}"
-  fi
-
-  if [[ -n "$TOPIC_ID" && ! "$TOPIC_ID" =~ ^[0-9]+$ ]]; then
-    echo "Ошибка: topic id должен быть числом"
-    return 1
-  fi
-
-  set_env "TELEGRAM_BOT_TOKEN" "$BOT_TOKEN"
-  set_env "TELEGRAM_CHAT_ID" "$CHAT_ID"
-  set_env "TELEGRAM_TOPIC_ID" "$TOPIC_ID"
-  set_env "TELEGRAM_ENABLED" "true"
-
-  echo
-  echo "ОК: Telegram настроен и включён"
-}
-
-telegram_toggle() {
-  if [[ "$(get_env TELEGRAM_ENABLED)" == "true" ]]; then
-    set_env "TELEGRAM_ENABLED" "false"
-    echo "ОК: Telegram-уведомления отключены"
-  else
-    set_env "TELEGRAM_ENABLED" "true"
-    echo "ОК: Telegram-уведомления включены"
-  fi
-}
-
-telegram_test() {
-  local -a curl_args
-  local CURL_OUTPUT TG_INGRESS_NODE_NAME
-
-  set -a
-  source "$ENV_FILE"
-  set +a
-
-  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_ADMIN_ID:-}}"
-  TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
-  INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$(default_ingress_node_name)}"
-
-  if [[ "${TELEGRAM_ENABLED:-false}" != "true" ]]; then
-    echo "Telegram выключен. Сначала включи его."
-    return 1
-  fi
-
-  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-    echo "Не задан TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID"
-    return 1
-  fi
-
-  if [[ -n "$TELEGRAM_TOPIC_ID" && ! "$TELEGRAM_TOPIC_ID" =~ ^[0-9]+$ ]]; then
-    echo "TELEGRAM_TOPIC_ID должен быть числом"
-    return 1
-  fi
-
-  TG_INGRESS_NODE_NAME="$(html_escape "$INGRESS_NODE_NAME")"
-
-  TEST_TEXT="✅ Torrent Blocker: тестовое уведомление
-
-Сообщение отправлено в указанный chat id и topic id, если он задан.
-
-━━━━━━━━━━━━━━━━━━━━
-Пример боевого report
-━━━━━━━━━━━━━━━━━━━━
-
-<b>🚫 Торрент заблокирован</b>
-
-<b>🖥 Сервер</b>
-• Входная нода: <code>${TG_INGRESS_NODE_NAME}</code>
-
-<b>⛔ Блокировка</b>
-• IP клиента: <code>46.1.1.1</code>
-• Срок: <code>1h</code>
-
-<b>👤 Пользователь</b>
-• ID: <code>1701</code>
-• Логин: <code>1701</code>
-• UUID: <code>123e4567-e89b-12d3-a456-426614174000</code>
-
-<b>📄 Report</b>
-• ID: <code>678</code>
-• Нода: <code>poland</code>
-• Страна: <code>PL</code>
-• Создан: <code>09.05.2026 02:27:47 UTC</code>"
-
-  curl_args=(
-    -fsS
-    --connect-timeout 10
-    --max-time 15
-    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    -d "chat_id=${TELEGRAM_CHAT_ID}"
-    --data-urlencode "text=${TEST_TEXT}"
-    -d "parse_mode=HTML"
-    -d "disable_web_page_preview=true"
-  )
-
-  if [[ -n "$TELEGRAM_TOPIC_ID" ]]; then
-    curl_args+=(-d "message_thread_id=${TELEGRAM_TOPIC_ID}")
-  fi
-
-  if ! CURL_OUTPUT="$(curl "${curl_args[@]}" 2>&1 >/dev/null)"; then
-    echo "Ошибка: тестовое уведомление не отправлено"
-    echo "$CURL_OUTPUT"
-    echo
-    echo "Проверь с сервера доступ к Telegram API:"
-    echo "  curl -v --connect-timeout 10 https://api.telegram.org"
-    return 1
-  fi
-
-  echo "ОК: тестовое уведомление с примером report отправлено"
 }
 
 validate_instance_name() {
@@ -699,9 +411,9 @@ instance_menu_bin() {
   local instance_name="$1"
 
   if [[ "$instance_name" == "default" ]]; then
-    echo "/usr/local/bin/torrent-blocker-menu"
+    echo "/usr/local/bin/torrent-blocker"
   else
-    echo "/usr/local/bin/torrent-blocker-${instance_name}-menu"
+    echo "/usr/local/bin/torrent-blocker-${instance_name}"
   fi
 }
 
@@ -802,11 +514,6 @@ INGRESS_NODE_NAME="$(escape_env_value "$ingress_node_name")"
 BAN_TIMEOUT="$(escape_env_value "$ban_timeout")"
 PAGE_SIZE="100"
 MAX_PAGES="5"
-
-TELEGRAM_ENABLED="false"
-TELEGRAM_BOT_TOKEN=""
-TELEGRAM_CHAT_ID=""
-TELEGRAM_TOPIC_ID=""
 EOF
 
   chmod 600 "$target_env_file"
@@ -828,7 +535,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=${app_dir}
-ExecStart=${app_dir}/torrent-blocker
+ExecStart=${app_dir}/torrent-blocker --run
 EOF
 
   cat > "$timer_dst" <<EOF
@@ -849,7 +556,7 @@ EOF
 add_panel_instance() {
   local instance_name
   local new_app_dir new_env_file new_service_unit new_timer_unit new_service_dst new_timer_dst new_menu_bin
-  local api_base api_token ban_timeout default_ban_timeout ingress_name default_node skip_old current_max_id
+  local api_base api_token ban_timeout default_ban_timeout ingress_name current_max_id
 
   echo
   echo "Подключение ещё одной панели"
@@ -923,23 +630,14 @@ add_panel_instance() {
     return 1
   fi
 
-  default_node="$(default_ingress_node_name)"
-  read -rp "Имя входной ноды [${default_node}]: " ingress_name
-  ingress_name="${ingress_name:-$default_node}"
+  ingress_name="$(default_ingress_node_name)"
 
-  read -rp "Пропустить старые torrent reports? [Y/n]: " skip_old
-  skip_old="${skip_old:-Y}"
+  echo "Получение текущего последнего report id..."
 
-  if [[ "$skip_old" =~ ^[YyДд]$ ]]; then
-    echo "Получение текущего последнего report id..."
-
-    if ! current_max_id="$(fetch_panel_reports_for_config "$api_base" "$api_token" 100 0 | jq -r '[.response.records[]?.id // 0] | max // 0')"; then
-      echo "Ошибка: не удалось получить reports из Remnawave API"
-      echo "Новая установка не создана."
-      return 1
-    fi
-  else
-    current_max_id="0"
+  if ! current_max_id="$(fetch_panel_reports_for_config "$api_base" "$api_token" 100 0 | jq -r '[.response.records[]?.id // 0] | max // 0')"; then
+    echo "Ошибка: не удалось получить reports из Remnawave API"
+    echo "Новая установка не создана."
+    return 1
   fi
 
   echo
@@ -959,7 +657,12 @@ add_panel_instance() {
   write_panel_systemd_units "$new_service_dst" "$new_timer_dst" "$instance_name" "$new_app_dir" "$new_service_unit"
 
   mkdir -p "$(dirname "$new_menu_bin")"
-  ln -sf "${new_app_dir}/torrent-blocker" "$new_menu_bin"
+  cat > "$new_menu_bin" <<EOF
+#!/usr/bin/env bash
+exec "${new_app_dir}/torrent-blocker" --menu "\$@"
+EOF
+  chmod 755 "$new_menu_bin"
+  rm -f "/usr/local/bin/torrent-blocker-${instance_name}-menu"
 
   systemctl daemon-reload
   systemctl enable --now "$new_timer_unit"
@@ -970,37 +673,6 @@ add_panel_instance() {
   echo "Каталог: ${new_app_dir}"
   echo "Меню:    ${new_menu_bin##*/}"
   echo "Timer:   ${new_timer_unit}"
-}
-
-telegram_menu() {
-  while true; do
-    clear
-    echo "╭────────────────────────────────────╮"
-    echo "│ Telegram уведомления               │"
-    echo "╰────────────────────────────────────╯"
-    echo
-    echo "Важно: доступность Telegram API в России может быть ограничена регуляторами."
-    echo "Если тест не отправляется, возможно нужен доступ через разрешённый прокси."
-    echo
-    echo "Статус:   $(telegram_state)"
-    echo "Chat ID:  $(display_value "$(telegram_chat_id)")"
-    echo "Topic ID: $(display_value "$(telegram_topic_id)")"
-    echo
-    echo "1) Настроить Telegram"
-    echo "2) Включить / отключить"
-    echo "3) Отправить тест"
-    echo "0) Назад"
-    echo
-    read -rp "Выбор: " CHOICE
-
-    case "$CHOICE" in
-      1) telegram_setup; pause ;;
-      2) telegram_toggle; pause ;;
-      3) telegram_test; pause ;;
-      0) return ;;
-      *) echo "Неверный пункт"; pause ;;
-    esac
-  done
 }
 
 settings_menu() {
@@ -1015,8 +687,7 @@ settings_menu() {
     echo "3) Заблокированные IP"
     echo "4) Логи"
     echo "5) Конфиг"
-    echo "6) Уведомления"
-    echo "7) Подключить ещё одну панель"
+    echo "6) Подключить ещё одну панель"
     echo "0) Назад"
     echo
     read -rp "Выбор: " CHOICE
@@ -1027,8 +698,7 @@ settings_menu() {
       3) show_banned; pause ;;
       4) show_logs; pause ;;
       5) edit_config; pause ;;
-      6) telegram_menu ;;
-      7) add_panel_instance || true; pause ;;
+      6) add_panel_instance || true; pause ;;
       0) return ;;
       *) echo "Неверный пункт"; pause ;;
     esac
@@ -1044,7 +714,6 @@ main_menu() {
     echo
     echo "Установка: $(display_value "$(get_env INSTANCE_NAME)")"
     echo "Сервис:   $(blocker_state)"
-    echo "Telegram: $(telegram_state)"
     echo
     echo "1) Включить / отключить"
     echo "2) Настройки"
@@ -1072,8 +741,6 @@ process_report_record() {
   local ID BLOCKED ACTION_IP SOURCE PROTOCOL OUTBOUND_TAG
   local USER_ID USERNAME USER_UUID NODE_NAME NODE_COUNTRY CREATED_AT CREATED_AT_FORMATTED
   local CLIENT_IP
-  local TG_INGRESS_NODE_NAME TG_CLIENT_IP TG_BAN_TIMEOUT TG_ID TG_USER_ID TG_USERNAME TG_USER_UUID
-  local TG_NODE_NAME TG_NODE_COUNTRY TG_CREATED_AT_FORMATTED TELEGRAM_TEXT
 
   ID="$(echo "$RECORD" | jq -r '.id // .reportId // .report.id // 0')"
 
@@ -1118,17 +785,6 @@ process_report_record() {
   CREATED_AT="$(safe_value "$CREATED_AT")"
   CREATED_AT_FORMATTED="$(format_timestamp "$CREATED_AT")"
 
-  TG_INGRESS_NODE_NAME="$(html_escape "$INGRESS_NODE_NAME")"
-  TG_CLIENT_IP="$(html_escape "$CLIENT_IP")"
-  TG_BAN_TIMEOUT="$(html_escape "$BAN_TIMEOUT")"
-  TG_ID="$(html_escape "$ID")"
-  TG_USER_ID="$(html_escape "$USER_ID")"
-  TG_USERNAME="$(html_escape "$USERNAME")"
-  TG_USER_UUID="$(html_escape "$USER_UUID")"
-  TG_NODE_NAME="$(html_escape "$NODE_NAME")"
-  TG_NODE_COUNTRY="$(html_escape "$NODE_COUNTRY")"
-  TG_CREATED_AT_FORMATTED="$(html_escape "$CREATED_AT_FORMATTED")"
-
   echo "Найден torrent-report:"
   echo "  Входная нода:    $INGRESS_NODE_NAME"
   echo "  ID report:       $ID"
@@ -1143,28 +799,6 @@ process_report_record() {
   echo "  Создан:          $CREATED_AT_FORMATTED"
 
   ban_ip "$CLIENT_IP" "$BAN_TIMEOUT"
-
-  TELEGRAM_TEXT="<b>🚫 Торрент заблокирован</b>
-
-<b>🖥 Сервер</b>
-• Входная нода: <code>${TG_INGRESS_NODE_NAME}</code>
-
-<b>⛔ Блокировка</b>
-• IP клиента: <code>${TG_CLIENT_IP}</code>
-• Срок: <code>${TG_BAN_TIMEOUT}</code>
-
-<b>👤 Пользователь</b>
-• ID: <code>${TG_USER_ID}</code>
-• Логин: <code>${TG_USERNAME}</code>
-• UUID: <code>${TG_USER_UUID}</code>
-
-<b>📄 Report</b>
-• ID: <code>${TG_ID}</code>
-• Нода: <code>${TG_NODE_NAME}</code>
-• Страна: <code>${TG_NODE_COUNTRY}</code>
-• Создан: <code>${TG_CREATED_AT_FORMATTED}</code>"
-
-  send_telegram "$TELEGRAM_TEXT"
 
   logger -t torrent-blocker \
     "ingress_node=$INGRESS_NODE_NAME report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован"

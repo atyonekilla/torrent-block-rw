@@ -2,15 +2,12 @@
 
 `Torrent Blocker RW` — Bash-агент для Remnawave. Он опрашивает Remnawave API, читает torrent/P2P reports и временно блокирует IP клиента через `nftables`.
 
-Подходит для входных серверов, которые сами должны банить клиентов на своём firewall.
+Подходит для входных серверов без remnanode, которые сами должны банить клиентов на своём firewall.
 
 ## Что умеет
 
 - опрашивает Remnawave Torrent Blocker reports через API;
 - блокирует IPv4 через `nftables` с timeout;
-- помнит последний обработанный report через `last_id`;
-- запускается по `systemd` timer;
-- имеет CLI-меню.
 
 ## Установка
 
@@ -20,19 +17,15 @@ curl -fsSL https://raw.githubusercontent.com/atyonekilla/torrent-block-rw/main/i
 
 Установщик сначала проверяет Remnawave API. Если URL или API-токен неверные, установка завершится до создания каталога установки, настройки `systemd` и `nftables`.
 
-Недостающие зависимости ставятся автоматически. Уже установленные пакеты пропускаются, а `apt update` запускается только если есть что устанавливать.
-
-Обычная установка создаёт одну панель:
-
 ```text
 /opt/torrent-blocker/
 /etc/systemd/system/torrent-blocker.service
 /etc/systemd/system/torrent-blocker.timer
-/usr/local/bin/torrent-blocker-menu
+/usr/local/bin/torrent-blocker
 ```
 
 ```bash
-sudo torrent-blocker-menu
+sudo torrent-blocker
 ```
 
 Ручная установка:
@@ -50,11 +43,10 @@ sudo bash install.sh
 Remnawave API URL
 Remnawave API token
 Время блокировки IP
-Имя входной ноды
-Пропускать ли старые reports
 ```
 
-Рекомендуется пропустить старые reports, чтобы блокироваться начали только новые нарушения.
+Старые reports пропускаются автоматически, чтобы блокироваться начали только новые нарушения.
+Имя входной ноды задаётся автоматически. При необходимости его можно поменять вручную в конфиге через меню.
 
 ## Файлы
 
@@ -80,7 +72,7 @@ sudo nano /opt/torrent-blocker/.env
 INSTANCE_NAME="default"
 SERVICE_UNIT="torrent-blocker.service"
 TIMER_UNIT="torrent-blocker.timer"
-MENU_BIN="/usr/local/bin/torrent-blocker-menu"
+MENU_BIN="/usr/local/bin/torrent-blocker"
 
 REMNAWAVE_API_BASE="https://admin.example.com"
 REMNAWAVE_API_TOKEN="PASTE_YOUR_REMNAWAVE_API_TOKEN_HERE"
@@ -90,11 +82,6 @@ INGRESS_NODE_NAME="gateway-1 (203.0.113.10)"
 BAN_TIMEOUT="1h"
 PAGE_SIZE="100"
 MAX_PAGES="5"
-
-TELEGRAM_ENABLED="false"
-TELEGRAM_BOT_TOKEN=""
-TELEGRAM_CHAT_ID=""
-TELEGRAM_TOPIC_ID=""
 ```
 
 Примеры `BAN_TIMEOUT`: `30m`, `1h`, `6h`, `1d`.
@@ -104,13 +91,13 @@ TELEGRAM_TOPIC_ID=""
 Меню:
 
 ```bash
-sudo torrent-blocker-menu
+sudo torrent-blocker
 ```
 
 Проверить сейчас:
 
 ```bash
-sudo /opt/torrent-blocker/torrent-blocker
+sudo /opt/torrent-blocker/torrent-blocker --run
 ```
 
 Статус:
@@ -148,7 +135,7 @@ sudo rm -f /etc/systemd/system/torrent-blocker.timer
 sudo systemctl daemon-reload
 
 sudo rm -rf /opt/torrent-blocker/
-sudo rm -f /usr/local/bin/torrent-blocker-menu
+sudo rm -f /usr/local/bin/torrent-blocker
 
 sudo nft delete table inet torrent_guard
 ```
