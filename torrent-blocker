@@ -727,27 +727,27 @@ fetch_panel_reports_for_config() {
     "$url")"; then
 
     rm -f "$body_file"
-    echo "Ошибка: не удалось подключиться к Remnawave API"
-    echo "URL: $url"
+    echo "Ошибка: не удалось подключиться к Remnawave API" >&2
+    echo "URL: $url" >&2
     return 1
   fi
 
   if [[ ! "$http_code" =~ ^2 ]]; then
-    echo "Ошибка: Remnawave API вернул HTTP $http_code"
-    echo "URL: $url"
-    echo "Ответ:"
-    head -c 800 "$body_file"
-    echo
+    echo "Ошибка: Remnawave API вернул HTTP $http_code" >&2
+    echo "URL: $url" >&2
+    echo "Ответ:" >&2
+    head -c 800 "$body_file" >&2
+    echo >&2
     rm -f "$body_file"
     return 1
   fi
 
   if ! jq -e . "$body_file" >/dev/null 2>&1; then
-    echo "Ошибка: Remnawave API вернул не JSON"
-    echo "URL: $url"
-    echo "Ответ:"
-    head -c 800 "$body_file"
-    echo
+    echo "Ошибка: Remnawave API вернул не JSON" >&2
+    echo "URL: $url" >&2
+    echo "Ответ:" >&2
+    head -c 800 "$body_file" >&2
+    echo >&2
     rm -f "$body_file"
     return 1
   fi

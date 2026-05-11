@@ -226,28 +226,28 @@ fetch_remnawave_reports() {
     "$url")"; then
 
     rm -f "$body_file"
-    echo "Ошибка: не удалось подключиться к Remnawave API"
-    echo "URL: $url"
+    echo "Ошибка: не удалось подключиться к Remnawave API" >&2
+    echo "URL: $url" >&2
     return 1
   fi
 
   if [[ ! "$http_code" =~ ^2 ]]; then
-    echo "Ошибка: Remnawave API вернул HTTP $http_code"
-    echo "URL: $url"
-    echo "Ответ:"
-    head -c 800 "$body_file"
-    echo
+    echo "Ошибка: Remnawave API вернул HTTP $http_code" >&2
+    echo "URL: $url" >&2
+    echo "Ответ:" >&2
+    head -c 800 "$body_file" >&2
+    echo >&2
     rm -f "$body_file"
     return 1
   fi
 
   if command -v jq >/dev/null 2>&1; then
     if ! jq -e . "$body_file" >/dev/null 2>&1; then
-      echo "Ошибка: Remnawave API вернул не JSON"
-      echo "URL: $url"
-      echo "Ответ:"
-      head -c 800 "$body_file"
-      echo
+      echo "Ошибка: Remnawave API вернул не JSON" >&2
+      echo "URL: $url" >&2
+      echo "Ответ:" >&2
+      head -c 800 "$body_file" >&2
+      echo >&2
       rm -f "$body_file"
       return 1
     fi
@@ -255,11 +255,11 @@ fetch_remnawave_reports() {
     first_char="$(awk '{ gsub(/[[:space:]]/, ""); if (length($0) > 0) { print substr($0, 1, 1); exit } }' "$body_file")"
 
     if [[ "$first_char" != "{" && "$first_char" != "[" ]]; then
-      echo "Ошибка: Remnawave API вернул не JSON"
-      echo "URL: $url"
-      echo "Ответ:"
-      head -c 800 "$body_file"
-      echo
+      echo "Ошибка: Remnawave API вернул не JSON" >&2
+      echo "URL: $url" >&2
+      echo "Ответ:" >&2
+      head -c 800 "$body_file" >&2
+      echo >&2
       rm -f "$body_file"
       return 1
     fi
