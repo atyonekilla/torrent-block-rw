@@ -270,6 +270,8 @@ fetch_remnawave_reports() {
 }
 
 check_remnawave_panel() {
+  local check_error
+
   echo
   echo "Проверка доступности панели Remnawave..."
 
@@ -283,7 +285,11 @@ check_remnawave_panel() {
     return 1
   fi
 
-  if ! fetch_remnawave_reports 1 0 >/dev/null; then
+  if ! check_error="$(fetch_remnawave_reports 1 0 2>&1 >/dev/null)"; then
+    if [[ -n "$check_error" ]]; then
+      echo "$check_error"
+    fi
+
     echo "Проверь URL панели, API-токен и доступ с сервера к панели."
     return 1
   fi
