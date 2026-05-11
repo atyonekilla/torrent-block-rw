@@ -35,31 +35,6 @@ curl -fsSL https://raw.githubusercontent.com/atyonekilla/torrent-block-rw/main/i
 sudo torrent-blocker-menu
 ```
 
-Путь в меню:
-
-```text
-Настройки -> Подключить ещё одну панель
-```
-
-Для второй панели, например `panel2`, будут созданы:
-
-```text
-/opt/torrent-blocker-panel2/
-/etc/systemd/system/torrent-blocker-panel2.service
-/etc/systemd/system/torrent-blocker-panel2.timer
-/usr/local/bin/torrent-blocker-panel2-menu
-```
-
-Перед созданием файлов меню проверит URL панели и API-токен. Если панель недоступна, новая установка не будет создана.
-
-Все установки используют общий `nftables` set `inet torrent_guard blocked_ipv4`, поэтому IP блокируется на одном firewall сервера.
-
-Для автоматизации имя установки всё ещё можно передать переменной:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/atyonekilla/torrent-block-rw/main/install.sh | sudo TORRENT_BLOCKER_INSTANCE=panel2 bash
-```
-
 Ручная установка:
 
 ```bash
@@ -95,8 +70,6 @@ Remnawave API token
 /etc/systemd/system/torrent-blocker.timer
 ```
 
-Для дополнительной установки имя добавляется в путь и unit-файлы: `/opt/torrent-blocker-panel2`, `torrent-blocker-panel2.timer`.
-
 ## Конфиг
 
 ```bash
@@ -126,30 +99,12 @@ TELEGRAM_TOPIC_ID=""
 
 Примеры `BAN_TIMEOUT`: `30m`, `1h`, `6h`, `1d`.
 
-## Дополнительно
-
-Уведомления можно включить после установки через меню:
-
-```bash
-sudo torrent-blocker-menu
-```
-
-Доступность Telegram API в России может быть ограничена регуляторами. Если тест не отправляется, возможно нужен доступ через разрешённый прокси.
-
-Если вводишь ID супергруппы без `-100`, например `1234567890`, меню автоматически сохранит его как `-1001234567890`.
-
 ## Команды
 
 Меню:
 
 ```bash
 sudo torrent-blocker-menu
-```
-
-Для дополнительной установки:
-
-```bash
-sudo torrent-blocker-panel2-menu
 ```
 
 Проверить сейчас:
@@ -197,19 +152,6 @@ sudo rm -f /usr/local/bin/torrent-blocker-menu
 
 sudo nft delete table inet torrent_guard
 ```
-
-Для дополнительной установки замени имя unit и каталог, например:
-
-```bash
-sudo systemctl disable --now torrent-blocker-panel2.timer
-sudo rm -f /etc/systemd/system/torrent-blocker-panel2.service
-sudo rm -f /etc/systemd/system/torrent-blocker-panel2.timer
-sudo rm -rf /opt/torrent-blocker-panel2/
-sudo rm -f /usr/local/bin/torrent-blocker-panel2-menu
-sudo systemctl daemon-reload
-```
-
-`nft delete table inet torrent_guard` выполняй только когда удалены все установки, потому что ban-list общий для всех панелей.
 
 ## Лицензия
 

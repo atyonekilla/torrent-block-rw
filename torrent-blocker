@@ -705,23 +705,6 @@ instance_menu_bin() {
   fi
 }
 
-next_panel_instance_name() {
-  local index candidate
-
-  index=2
-
-  while true; do
-    candidate="panel${index}"
-
-    if [[ ! -e "$(instance_app_dir "$candidate")" && ! -e "/etc/systemd/system/$(instance_timer_unit "$candidate")" && ! -e "$(instance_menu_bin "$candidate")" ]]; then
-      echo "$candidate"
-      return 0
-    fi
-
-    index=$((index + 1))
-  done
-}
-
 fetch_panel_reports_for_config() {
   local api_base="$1"
   local api_token="$2"
@@ -859,7 +842,7 @@ EOF
 }
 
 add_panel_instance() {
-  local default_name instance_name
+  local instance_name
   local new_app_dir new_env_file new_service_unit new_timer_unit new_service_dst new_timer_dst new_menu_bin
   local api_base api_token ban_timeout default_ban_timeout ingress_name default_node skip_old current_max_id
 
@@ -871,9 +854,12 @@ add_panel_instance() {
 
   check_required_commands
 
-  default_name="$(next_panel_instance_name)"
-  read -rp "Имя установки [${default_name}]: " instance_name
-  instance_name="${instance_name:-$default_name}"
+  read -rp "Как назвать эту панель: " instance_name
+
+  if [[ -z "$instance_name" ]]; then
+    echo "Ошибка: имя панели не может быть пустым"
+    return 1
+  fi
 
   if [[ "$instance_name" == "default" ]]; then
     echo "Ошибка: default уже используется основной установкой"
@@ -881,7 +867,7 @@ add_panel_instance() {
   fi
 
   if ! validate_instance_name "$instance_name"; then
-    echo "Ошибка: имя установки может содержать только A-Z, a-z, 0-9 и дефис"
+    echo "Ошибка: имя панели может содержать только A-Z, a-z, 0-9 и дефис"
     return 1
   fi
 

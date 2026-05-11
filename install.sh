@@ -26,6 +26,23 @@ cleanup() {
 
 trap cleanup EXIT
 
+prompt_input() {
+  local prompt="$1"
+  local value
+
+  if [[ -r /dev/tty ]]; then
+    IFS= read -r -p "$prompt" value </dev/tty || true
+  elif [[ -t 0 ]]; then
+    IFS= read -r -p "$prompt" value || true
+  else
+    echo "Ошибка: нужен интерактивный терминал для ввода настроек" >&2
+    echo "Запусти установку из обычной SSH-сессии: curl ... | sudo bash" >&2
+    exit 1
+  fi
+
+  printf '%s' "$value"
+}
+
 download_file() {
   local source_path="$1"
   local target_path="$2"
@@ -152,7 +169,7 @@ ask_ingress_node_name() {
   local default_name
 
   default_name="$(default_ingress_node_name)"
-  read -rp "Имя входной ноды [${default_name}]: " INGRESS_NODE_NAME
+  INGRESS_NODE_NAME="$(prompt_input "Имя входной ноды [${default_name}]: ")"
   INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$default_name}"
 }
 
@@ -276,7 +293,7 @@ check_remnawave_panel() {
 
 collect_new_config() {
   echo
-  read -rp "Remnawave API URL, пример https://admin.example.com: " REMNAWAVE_API_BASE
+  REMNAWAVE_API_BASE="$(prompt_input "Remnawave API URL, пример https://admin.example.com: ")"
 
   if [[ -z "$REMNAWAVE_API_BASE" ]]; then
     echo "Ошибка: Remnawave API URL не может быть пустым"
@@ -285,7 +302,7 @@ collect_new_config() {
 
   REMNAWAVE_API_BASE="${REMNAWAVE_API_BASE%/}"
 
-  read -rp "Remnawave API token: " REMNAWAVE_API_TOKEN
+  REMNAWAVE_API_TOKEN="$(prompt_input "Remnawave API token: ")"
 
   if [[ -z "$REMNAWAVE_API_TOKEN" ]]; then
     echo "Ошибка: Remnawave API token не может быть пустым"
@@ -294,7 +311,7 @@ collect_new_config() {
 
   check_remnawave_panel
 
-  read -rp "Время блокировки [1h]: " BAN_TIMEOUT
+  BAN_TIMEOUT="$(prompt_input "Время блокировки [1h]: ")"
   BAN_TIMEOUT="${BAN_TIMEOUT:-1h}"
 
   if ! [[ "$BAN_TIMEOUT" =~ ^[0-9]+[smhd]$ ]]; then
@@ -453,7 +470,7 @@ chmod 600 "${APP_DIR}/last_id"
 
 if [[ ! -s "${APP_DIR}/last_id" ]]; then
   echo
-  read -rp "Пропустить старые torrent reports? [Y/n]: " SKIP_OLD
+  SKIP_OLD="$(prompt_input "Пропустить старые torrent reports? [Y/n]: ")"
   SKIP_OLD="${SKIP_OLD:-Y}"
 
   if [[ "$SKIP_OLD" =~ ^[YyДд]$ ]]; then
