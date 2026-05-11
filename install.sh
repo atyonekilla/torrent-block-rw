@@ -165,6 +165,20 @@ get_env() {
   fi
 }
 
+remove_env_keys() {
+  local tmp
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+
+  grep -Ev '^(TELEGRAM_ENABLED|TELEGRAM_BOT_TOKEN|TELEGRAM_ADMIN_ID|TELEGRAM_CHAT_ID|TELEGRAM_TOPIC_ID)=' "$ENV_FILE" > "$tmp" || true
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
 load_env() {
   set -a
   source "$ENV_FILE"
@@ -377,6 +391,9 @@ EOF
 }
 
 write_menu_command() {
+  mkdir -p "$(dirname "$MENU_BIN")"
+  rm -f "$MENU_BIN"
+
   cat > "$MENU_BIN" <<EOF
 #!/usr/bin/env bash
 exec "${APP_DIR}/torrent-blocker" --menu "\$@"
@@ -436,6 +453,7 @@ rm -f "${APP_DIR}/menu"
 if [[ "$HAS_EXISTING_ENV" == "false" ]]; then
   write_env_file
 else
+  remove_env_keys
   set_env "INSTANCE_NAME" "$INSTANCE_NAME"
   set_env "SERVICE_UNIT" "$SERVICE_UNIT"
   set_env "TIMER_UNIT" "$TIMER_UNIT"
