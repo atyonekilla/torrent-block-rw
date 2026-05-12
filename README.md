@@ -1,6 +1,6 @@
 # Torrent Blocker RW
 
-`Torrent Blocker RW` — Bash-агент для Remnawave. Он опрашивает Remnawave API, читает torrent/P2P reports и временно блокирует IP клиента через `nftables`.
+`Torrent Blocker RW` — Bash-агент для Remnawave. Внимание! Только для входных серверов без remnanode. Опрашивает Remnawave API, читает torrent/P2P reports и временно блокирует IP клиента через `nftables`.
 
 Подходит для входных серверов без remnanode, которые сами должны банить клиентов на своём firewall.
 
@@ -85,6 +85,12 @@ MAX_PAGES="5"
 ```
 
 Примеры `BAN_TIMEOUT`: `30m`, `1h`, `6h`, `1d`.
+
+`PAGE_SIZE` — сколько reports запрашивать из Remnawave API за один запрос. Допустимые значения: от `1` до `500`.
+
+`MAX_PAGES` — сколько страниц reports максимум проверять за один запуск. Допустимые значения: от `1` до `50`.
+
+При `PAGE_SIZE="100"` и `MAX_PAGES="5"` скрипт проверит до `500` последних reports за запуск. Уже обработанные или старые reports пропускаются по `last_id`.
 
 ## Команды
 
