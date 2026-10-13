@@ -3,13 +3,17 @@ set -euo pipefail
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
 SCRIPT_PATH="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
-SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 
 APP_DIR="${TORRENT_BLOCKER_APP_DIR:-$SCRIPT_DIR}"
+source "${SCRIPT_DIR}/common.sh"
 ENV_FILE="${APP_DIR}/.env"
 APP_SCRIPT="${APP_DIR}/torrent-blocker"
 LAST_ID_FILE="${APP_DIR}/last_id"
 LOCK_FILE="${APP_DIR}/torrent-blocker.lock"
+STATE_DIR="${TORRENT_BLOCKER_STATE_DIR:-/var/lib/torrent-blocker}"
+FIREWALL_LOCK="${TORRENT_BLOCKER_FIREWALL_LOCK:-/run/lock/torrent-blocker-firewall.lock}"
+BANS_FILE="${STATE_DIR}/bans.json"
 
 TABLE="torrent_guard"
 SET="blocked_ipv4"
@@ -40,7 +44,7 @@ default_ingress_node_name() {
   local host_name ip_address
 
   host_name="$(hostname 2>/dev/null || echo "unknown-host")"
-  read -r ip_address _ < <(hostname -I 2>/dev/null || true)
+  read -r ip_address _ < <(hostname -I 2>/dev/null || true) || true
 
   if [[ -n "${ip_address:-}" ]]; then
     echo "${host_name} (${ip_address})"
@@ -64,9 +68,7 @@ load_runtime_config() {
     exit 1
   fi
 
-  set -a
-  source "$ENV_FILE"
-  set +a
+  load_config_file "$ENV_FILE" || return 1
 
   INSTANCE_NAME="${INSTANCE_NAME:-default}"
   SERVICE_UNIT="${SERVICE_UNIT:-torrent-blocker.service}"
@@ -77,70 +79,133 @@ load_runtime_config() {
   PAGE_SIZE="${PAGE_SIZE:-100}"
   MAX_PAGES="${MAX_PAGES:-5}"
   INGRESS_NODE_NAME="${INGRESS_NODE_NAME:-$(default_ingress_node_name)}"
+  REPORT_NODE_NAME="${REPORT_NODE_NAME:-}"
+  ALLOWLIST_IPV4="${ALLOWLIST_IPV4:-}"
+  local allowed_ip
+  local -a allowed_ips
+  read -r -a allowed_ips <<< "$ALLOWLIST_IPV4"
+  for allowed_ip in "${allowed_ips[@]}"; do
+    is_ipv4 "$allowed_ip" || { echo "Ошибка: неверный IPv4 в ALLOWLIST_IPV4" >&2; return 1; }
+  done
 
-  if ! [[ "$BAN_TIMEOUT" =~ ^[0-9]+[smhd]$ ]]; then
-    echo "Ошибка: BAN_TIMEOUT должен быть в формате 30s, 30m, 1h или 1d"
-    exit 1
-  fi
+  validate_timeout "$BAN_TIMEOUT" || return 1
 
-  if ! [[ "$PAGE_SIZE" =~ ^[0-9]+$ ]] || (( PAGE_SIZE < 1 || PAGE_SIZE > 500 )); then
-    echo "Ошибка: PAGE_SIZE должен быть числом от 1 до 500"
-    exit 1
-  fi
-
-  if ! [[ "$MAX_PAGES" =~ ^[0-9]+$ ]] || (( MAX_PAGES < 1 || MAX_PAGES > 50 )); then
-    echo "Ошибка: MAX_PAGES должен быть числом от 1 до 50"
-    exit 1
-  fi
+  validate_pagination "$PAGE_SIZE" "$MAX_PAGES" || return 1
 
 }
 
 require_api_config() {
-  if [[ -z "${REMNAWAVE_API_BASE:-}" ]]; then
-    echo "Ошибка: REMNAWAVE_API_BASE не задан"
-    exit 1
-  fi
-
-  if [[ -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
-    echo "Ошибка: REMNAWAVE_API_TOKEN не задан"
-    exit 1
-  fi
+  validate_api_config "${REMNAWAVE_API_BASE:-}" "${REMNAWAVE_API_TOKEN:-}"
 }
 
 init_last_id() {
-  LAST_ID="0"
-
+  LAST_ID=0
   if [[ -f "$LAST_ID_FILE" ]]; then
-    LAST_ID="$(cat "$LAST_ID_FILE" | tr -dc '0-9')"
-    LAST_ID="${LAST_ID:-0}"
+    LAST_ID="$(cat "$LAST_ID_FILE")"
+    if ! [[ "$LAST_ID" =~ ^(0|[1-9][0-9]{0,15})$ ]] || (( LAST_ID > 9007199254740991 )); then
+      echo "Ошибка: повреждён last_id; автоматический сброс запрещён." >&2
+      return 1
+    fi
   else
-    echo "0" > "$LAST_ID_FILE"
-    chmod 600 "$LAST_ID_FILE"
+    save_last_id 0
   fi
 }
 
 ensure_nft() {
-  nft add table inet "$TABLE" 2>/dev/null || true
-
-  nft add set inet "$TABLE" "$SET" '{ type ipv4_addr; flags timeout; }' 2>/dev/null || true
-
-  nft add chain inet "$TABLE" "$CHAIN" '{ type filter hook input priority -110; policy accept; }' 2>/dev/null || true
-
-  if ! nft list chain inet "$TABLE" "$CHAIN" 2>/dev/null | grep -q "ip saddr @${SET} drop"; then
-    nft add rule inet "$TABLE" "$CHAIN" ip saddr "@${SET}" drop
+  nft list table inet "$TABLE" >/dev/null 2>&1 || nft add table inet "$TABLE" || return 1
+  nft list set inet "$TABLE" "$SET" >/dev/null 2>&1 ||
+    nft add set inet "$TABLE" "$SET" '{ type ipv4_addr; flags timeout; }' || return 1
+  nft list chain inet "$TABLE" "$CHAIN" >/dev/null 2>&1 ||
+    nft add chain inet "$TABLE" "$CHAIN" '{ type filter hook input priority -110; policy accept; }' || return 1
+  local rules
+  rules="$(nft list chain inet "$TABLE" "$CHAIN")" || return 1
+  if ! grep -q "ip saddr @${SET} drop" <<< "$rules"; then
+    nft add rule inet "$TABLE" "$CHAIN" ip saddr "@${SET}" drop || return 1
   fi
 }
 
+load_bans() {
+  local bans
+  mkdir -p "$STATE_DIR" || return 1
+  chmod 700 "$STATE_DIR" || return 1
+  bans='{}'
+  if [[ -f "$BANS_FILE" ]]; then
+    bans="$(cat "$BANS_FILE")" || return 1
+  elif nft list set inet "$TABLE" "$SET" >/dev/null 2>&1; then
+    # First upgrade: retain the remaining lifetime of existing timed bans.
+    local existing now
+    existing="$(nft -j list set inet "$TABLE" "$SET")" || return 1
+    now="$(date +%s)"
+    bans="$(jq --argjson now "$now" '
+      [.nftables[] | .set? | select(. != null) | .elem[]? | .elem
+       | select(.expires? > 0) | {key: .val, value: ($now + (.expires | floor))}]
+      | from_entries' <<< "$existing")" || return 1
+  fi
+  if ! jq -e 'type == "object" and all(to_entries[];
+      (.key | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")) and
+      (.value | type == "number" and . > 0 and . <= 9007199254740991 and floor == .))' \
+      <<< "$bans" >/dev/null; then
+    echo "Ошибка: повреждён журнал блокировок $BANS_FILE" >&2
+    return 1
+  fi
+  local keys ip
+  keys="$(jq -r 'keys[]' <<< "$bans")" || return 1
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    is_ipv4 "$ip" || return 1
+  done <<< "$keys"
+  printf '%s\n' "$bans"
+}
+
+save_bans() {
+  local tmp bans="$1"
+  tmp="$(mktemp "${STATE_DIR}/bans.XXXXXX")" || return 1
+  if ! printf '%s\n' "$bans" > "$tmp" || ! mv "$tmp" "$BANS_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+apply_ban_until() {
+  local ip="$1" expiry="$2" now remaining transaction=""
+  now="$(date +%s)"
+  remaining=$((expiry - now))
+  (( remaining > 0 )) || return 0
+  if nft get element inet "$TABLE" "$SET" "{ $ip }" >/dev/null 2>&1; then
+    transaction="delete element inet $TABLE $SET { $ip }"$'\n'
+  fi
+  transaction+="add element inet $TABLE $SET { $ip timeout ${remaining}s }"
+  # One nft batch is atomic: an add failure cannot remove the existing ban.
+  printf '%s\n' "$transaction" | nft -f -
+}
+
+restore_bans() (
+  exec 8>"$FIREWALL_LOCK" || exit 1
+  flock -x 8 || exit 1
+  local restored_bans
+  restored_bans="$(load_bans)" || exit 1
+  local now entries ip expiry
+  now="$(date +%s)"
+  restored_bans="$(jq --argjson now "$now" 'with_entries(select(.value > $now))' <<< "$restored_bans")" || exit 1
+  save_bans "$restored_bans" || exit 1
+  ensure_nft || exit 1
+  entries="$(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$restored_bans")" || exit 1
+  while IFS=$'\t' read -r ip expiry; do
+    [[ -z "$ip" ]] && continue
+    apply_ban_until "$ip" "$expiry" || exit 1
+  done <<< "$entries"
+)
+
 is_ipv4() {
-  local ip="$1"
+  local ip="$1" o o1 o2 o3 o4
 
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
 
   IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
 
   for o in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$o" =~ ^[0-9]+$ ]] || return 1
-    (( o >= 0 && o <= 255 )) || return 1
+    [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
   done
 
   return 0
@@ -167,65 +232,29 @@ format_timestamp() {
   date -u -d "$value" "+%d.%m.%Y %H:%M:%S UTC" 2>/dev/null || echo "$value"
 }
 
-ban_ip() {
-  local ip="$1"
-  local timeout="$2"
-
-  ensure_nft
-
-  nft delete element inet "$TABLE" "$SET" "{ $ip }" 2>/dev/null || true
-  nft add element inet "$TABLE" "$SET" "{ $ip timeout $timeout }"
-
-  logger -t torrent-blocker "заблокирован ip=$ip время_блокировки=$timeout"
-  echo "ОК: IP $ip заблокирован на $timeout"
-}
+ban_ip() (
+  local ip="$1" timeout="$2" now expiry old_expiry seconds
+  exec 8>"$FIREWALL_LOCK" || exit 1
+  flock -x 8 || exit 1
+  local current_bans
+  current_bans="$(load_bans)" || exit 1
+  now="$(date +%s)"
+  seconds="$(timeout_seconds "$timeout")" || exit 1
+  expiry=$((now + seconds))
+  old_expiry="$(jq -r --arg ip "$ip" '.[$ip] // 0' <<< "$current_bans")" || exit 1
+  (( old_expiry <= expiry )) || expiry="$old_expiry"
+  current_bans="$(jq --arg ip "$ip" --argjson expiry "$expiry" --argjson now "$now" \
+    'with_entries(select(.value > $now)) | .[$ip] = $expiry' <<< "$current_bans")" || exit 1
+  # Persist intent before touching the firewall; retries restore it after a failure.
+  save_bans "$current_bans" || exit 1
+  ensure_nft || exit 1
+  apply_ban_until "$ip" "$expiry" || exit 1
+  logger -t torrent-blocker "заблокирован ip=$ip до=$expiry" || true
+  echo "ОК: IP $ip заблокирован до $(date -u -d "@$expiry" '+%F %T UTC')"
+)
 
 fetch_page() {
-  local start="$1"
-  local body_file http_code url
-
-  url="${REMNAWAVE_API_BASE%/}/api/node-plugins/torrent-blocker?size=${PAGE_SIZE}&start=${start}"
-  body_file="$(mktemp)"
-
-  if ! http_code="$(curl -sS \
-    --connect-timeout 10 \
-    --max-time 30 \
-    --retry 2 \
-    --retry-delay 1 \
-    -H "Authorization: Bearer ${REMNAWAVE_API_TOKEN}" \
-    -H "Accept: application/json" \
-    -o "$body_file" \
-    -w "%{http_code}" \
-    "$url")"; then
-
-    rm -f "$body_file"
-    echo "Ошибка: не удалось подключиться к Remnawave API" >&2
-    echo "URL: $url" >&2
-    return 1
-  fi
-
-  if [[ ! "$http_code" =~ ^2 ]]; then
-    echo "Ошибка: Remnawave API вернул HTTP $http_code" >&2
-    echo "URL: $url" >&2
-    echo "Ответ:" >&2
-    head -c 800 "$body_file" >&2
-    echo >&2
-    rm -f "$body_file"
-    return 1
-  fi
-
-  if ! jq -e . "$body_file" >/dev/null 2>&1; then
-    echo "Ошибка: Remnawave API вернул не JSON" >&2
-    echo "URL: $url" >&2
-    echo "Ответ:" >&2
-    head -c 800 "$body_file" >&2
-    echo >&2
-    rm -f "$body_file"
-    return 1
-  fi
-
-  cat "$body_file"
-  rm -f "$body_file"
+  fetch_reports "$REMNAWAVE_API_BASE" "$REMNAWAVE_API_TOKEN" "$PAGE_SIZE" "$1"
 }
 
 save_last_id() {
@@ -237,10 +266,11 @@ save_last_id() {
     exit 1
   fi
 
-  tmp_file="$(mktemp "${APP_DIR}/last_id.XXXXXX")"
-  echo "$new_last_id" > "$tmp_file"
-  chmod 600 "$tmp_file"
-  mv "$tmp_file" "$LAST_ID_FILE"
+  tmp_file="$(mktemp "${APP_DIR}/last_id.XXXXXX")" || return 1
+  if ! printf '%s\n' "$new_last_id" > "$tmp_file" || ! mv "$tmp_file" "$LAST_ID_FILE"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
 }
 
 require_menu_root() {
@@ -250,22 +280,9 @@ require_menu_root() {
   fi
 }
 
-escape_env_value() {
-  local value="${1:-}"
 
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
 
-  echo "$value"
-}
 
-get_env() {
-  local key="$1"
-
-  if [[ -f "$ENV_FILE" ]]; then
-    grep "^${key}=" "$ENV_FILE" | head -n1 | cut -d= -f2- | sed 's/^"//; s/"$//' || true
-  fi
-}
 
 pause() {
   echo
@@ -323,7 +340,7 @@ toggle_blocker() {
 
   if systemctl is-active --quiet "$timer_unit"; then
     systemctl disable --now "$timer_unit"
-    echo "ОК: Torrent Blocker отключён"
+    echo "ОК: опрос отключён. Действующие баны сохраняются до истечения срока."
   else
     systemctl enable --now "$timer_unit"
     echo "ОК: Torrent Blocker включён"
@@ -418,54 +435,7 @@ instance_menu_bin() {
 }
 
 fetch_panel_reports_for_config() {
-  local api_base="$1"
-  local api_token="$2"
-  local size="$3"
-  local start="$4"
-  local body_file http_code url
-
-  url="${api_base%/}/api/node-plugins/torrent-blocker?size=${size}&start=${start}"
-  body_file="$(mktemp)"
-
-  if ! http_code="$(curl -sS \
-    --connect-timeout 10 \
-    --max-time 30 \
-    --retry 2 \
-    --retry-delay 1 \
-    -H "Authorization: Bearer ${api_token}" \
-    -H "Accept: application/json" \
-    -o "$body_file" \
-    -w "%{http_code}" \
-    "$url")"; then
-
-    rm -f "$body_file"
-    echo "Ошибка: не удалось подключиться к Remnawave API" >&2
-    echo "URL: $url" >&2
-    return 1
-  fi
-
-  if [[ ! "$http_code" =~ ^2 ]]; then
-    echo "Ошибка: Remnawave API вернул HTTP $http_code" >&2
-    echo "URL: $url" >&2
-    echo "Ответ:" >&2
-    head -c 800 "$body_file" >&2
-    echo >&2
-    rm -f "$body_file"
-    return 1
-  fi
-
-  if ! jq -e . "$body_file" >/dev/null 2>&1; then
-    echo "Ошибка: Remnawave API вернул не JSON" >&2
-    echo "URL: $url" >&2
-    echo "Ответ:" >&2
-    head -c 800 "$body_file" >&2
-    echo >&2
-    rm -f "$body_file"
-    return 1
-  fi
-
-  cat "$body_file"
-  rm -f "$body_file"
+  fetch_reports "$@"
 }
 
 check_panel_api_config() {
@@ -490,33 +460,10 @@ check_panel_api_config() {
 }
 
 write_panel_env_file() {
-  local target_env_file="$1"
-  local instance_name="$2"
-  local service_unit="$3"
-  local timer_unit="$4"
-  local menu_bin="$5"
-  local api_base="$6"
-  local api_token="$7"
-  local ingress_node_name="$8"
-  local ban_timeout="$9"
-
-  cat > "$target_env_file" <<EOF
-INSTANCE_NAME="$(escape_env_value "$instance_name")"
-SERVICE_UNIT="$(escape_env_value "$service_unit")"
-TIMER_UNIT="$(escape_env_value "$timer_unit")"
-MENU_BIN="$(escape_env_value "$menu_bin")"
-
-REMNAWAVE_API_BASE="$(escape_env_value "${api_base%/}")"
-REMNAWAVE_API_TOKEN="$(escape_env_value "$api_token")"
-
-INGRESS_NODE_NAME="$(escape_env_value "$ingress_node_name")"
-
-BAN_TIMEOUT="$(escape_env_value "$ban_timeout")"
-PAGE_SIZE="100"
-MAX_PAGES="5"
-EOF
-
-  chmod 600 "$target_env_file"
+  write_config_file "$1" \
+    INSTANCE_NAME "$2" SERVICE_UNIT "$3" TIMER_UNIT "$4" MENU_BIN "$5" \
+    REMNAWAVE_API_BASE "${6%/}" REMNAWAVE_API_TOKEN "$7" INGRESS_NODE_NAME "$8" \
+    BAN_TIMEOUT "$9" PAGE_SIZE 100 MAX_PAGES 5 REPORT_NODE_NAME "" ALLOWLIST_IPV4 ""
 }
 
 write_panel_systemd_units() {
@@ -529,7 +476,7 @@ write_panel_systemd_units() {
   cat > "$service_dst" <<EOF
 [Unit]
 Description=Torrent Blocker (${instance_name}) - опрос Remnawave reports и локальная блокировка IP
-After=network-online.target
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
@@ -543,7 +490,7 @@ EOF
 Description=Запуск Torrent Blocker (${instance_name}) каждые 15 секунд
 
 [Timer]
-OnBootSec=30
+OnBootSec=5
 OnUnitActiveSec=15s
 AccuracySec=1s
 Unit=${service_unit}
@@ -566,7 +513,7 @@ add_panel_instance() {
 
   check_required_commands
 
-  read -rp "Как назвать эту панель: " instance_name
+  instance_name="$(prompt_input "Как назвать эту панель: ")" || return 1
 
   if [[ -z "$instance_name" ]]; then
     echo "Ошибка: имя панели не может быть пустым"
@@ -599,7 +546,7 @@ add_panel_instance() {
     return 1
   fi
 
-  read -rp "Remnawave API URL, пример https://admin.example.com: " api_base
+  api_base="$(prompt_input "Remnawave API URL, пример https://admin.example.com: ")" || return 1
 
   if [[ -z "$api_base" ]]; then
     echo "Ошибка: Remnawave API URL не может быть пустым"
@@ -608,7 +555,7 @@ add_panel_instance() {
 
   api_base="${api_base%/}"
 
-  read -rp "Remnawave API token: " api_token
+  api_token="$(prompt_input "Remnawave API token (ввод скрыт): " true)" || return 1
 
   if [[ -z "$api_token" ]]; then
     echo "Ошибка: Remnawave API token не может быть пустым"
@@ -622,13 +569,10 @@ add_panel_instance() {
 
   default_ban_timeout="$(get_env BAN_TIMEOUT)"
   default_ban_timeout="${default_ban_timeout:-1h}"
-  read -rp "Время блокировки [${default_ban_timeout}]: " ban_timeout
+  ban_timeout="$(prompt_input "Время блокировки [${default_ban_timeout}]: ")" || return 1
   ban_timeout="${ban_timeout:-$default_ban_timeout}"
 
-  if ! [[ "$ban_timeout" =~ ^[0-9]+[smhd]$ ]]; then
-    echo "Ошибка: время блокировки должно быть в формате 30s, 30m, 1h или 1d"
-    return 1
-  fi
+  validate_timeout "$ban_timeout" || return 1
 
   ingress_name="$(default_ingress_node_name)"
 
@@ -643,17 +587,17 @@ add_panel_instance() {
   echo
   echo "Создание установки ${instance_name}..."
 
-  systemctl enable --now nftables
   mkdir -p "$new_app_dir"
   chmod 700 "$new_app_dir"
 
   install -m 700 "$APP_SCRIPT" "${new_app_dir}/torrent-blocker"
+  install -m 600 "${SCRIPT_DIR}/common.sh" "${new_app_dir}/common.sh"
   write_panel_env_file "$new_env_file" "$instance_name" "$new_service_unit" "$new_timer_unit" "$new_menu_bin" "$api_base" "$api_token" "$ingress_name" "$ban_timeout"
 
   echo "$current_max_id" > "${new_app_dir}/last_id"
   chmod 600 "${new_app_dir}/last_id"
 
-  ensure_nft
+  restore_bans
   write_panel_systemd_units "$new_service_dst" "$new_timer_dst" "$instance_name" "$new_app_dir" "$new_service_unit"
 
   mkdir -p "$(dirname "$new_menu_bin")"
@@ -698,7 +642,7 @@ settings_menu() {
       3) show_banned; pause ;;
       4) show_logs; pause ;;
       5) edit_config; pause ;;
-      6) add_panel_instance || true; pause ;;
+      6) bash "$APP_SCRIPT" --add-panel || echo "Подключение панели завершилось ошибкой"; pause ;;
       0) return ;;
       *) echo "Неверный пункт"; pause ;;
     esac
@@ -742,20 +686,25 @@ process_report_record() {
   local USER_ID USERNAME USER_UUID NODE_NAME NODE_COUNTRY CREATED_AT CREATED_AT_FORMATTED
   local CLIENT_IP
 
-  ID="$(echo "$RECORD" | jq -r '.id // .reportId // .report.id // 0')"
+  ID="$(echo "$RECORD" | jq -r '.id // .reportId // .report.id // 0')" || return 1
 
-  BLOCKED="$(echo "$RECORD" | jq -r '.report.actionReport.blocked // .report.actionReport.isBlocked // false')"
-  ACTION_IP="$(echo "$RECORD" | jq -r '.report.actionReport.ip // .report.actionReport.clientIp // .report.actionReport.client_ip // empty')"
-  SOURCE="$(echo "$RECORD" | jq -r '.report.xrayReport.source // .report.xrayReport.sourceIp // empty')"
-  PROTOCOL="$(echo "$RECORD" | jq -r '.report.xrayReport.protocol // empty')"
-  OUTBOUND_TAG="$(echo "$RECORD" | jq -r '.report.xrayReport.outboundTag // .report.xrayReport.outbound // empty')"
+  BLOCKED="$(echo "$RECORD" | jq -r '.report.actionReport.blocked // .report.actionReport.isBlocked // false')" || return 1
+  ACTION_IP="$(echo "$RECORD" | jq -r '.report.actionReport.ip // .report.actionReport.clientIp // .report.actionReport.client_ip // empty')" || return 1
+  SOURCE="$(echo "$RECORD" | jq -r '.report.xrayReport.source // .report.xrayReport.sourceIp // empty')" || return 1
+  PROTOCOL="$(echo "$RECORD" | jq -r '.report.xrayReport.protocol // empty')" || return 1
+  OUTBOUND_TAG="$(echo "$RECORD" | jq -r '.report.xrayReport.outboundTag // .report.xrayReport.outbound // empty')" || return 1
 
-  USER_ID="$(echo "$RECORD" | jq -r '.userId // .report.actionReport.userId // .user.id // empty')"
-  USERNAME="$(echo "$RECORD" | jq -r '.user.username // .username // empty')"
-  USER_UUID="$(echo "$RECORD" | jq -r '.user.uuid // .user.vlessUuid // .userUuid // empty')"
-  NODE_NAME="$(echo "$RECORD" | jq -r '.node.name // .nodeName // empty')"
-  NODE_COUNTRY="$(echo "$RECORD" | jq -r '.node.countryCode // .node.country // empty')"
-  CREATED_AT="$(echo "$RECORD" | jq -r '.createdAt // .timestamp // .report.createdAt // empty')"
+  USER_ID="$(echo "$RECORD" | jq -r '.userId // .report.actionReport.userId // .user.id // empty')" || return 1
+  USERNAME="$(echo "$RECORD" | jq -r '.user.username // .username // empty')" || return 1
+  USER_UUID="$(echo "$RECORD" | jq -r '.user.uuid // .user.vlessUuid // .userUuid // empty')" || return 1
+  NODE_NAME="$(echo "$RECORD" | jq -r '.node.name // .nodeName // empty')" || return 1
+  NODE_COUNTRY="$(echo "$RECORD" | jq -r '.node.countryCode // .node.country // empty')" || return 1
+  CREATED_AT="$(echo "$RECORD" | jq -r '.createdAt // .timestamp // .report.createdAt // empty')" || return 1
+
+  if [[ -n "${REPORT_NODE_NAME:-}" && "$NODE_NAME" != "$REPORT_NODE_NAME" ]]; then
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    return 0
+  fi
 
   CLIENT_IP="$ACTION_IP"
 
@@ -774,6 +723,17 @@ process_report_record() {
     SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
     return 0
   fi
+
+  local allowed_ip
+  local -a allowed_ips
+  read -r -a allowed_ips <<< "${ALLOWLIST_IPV4:-}"
+  for allowed_ip in "${allowed_ips[@]}"; do
+    if [[ "$CLIENT_IP" == "$allowed_ip" ]]; then
+      echo "Пропуск report id=$ID: IP в ALLOWLIST_IPV4"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      return 0
+    fi
+  done
 
   USER_ID="$(safe_value "$USER_ID")"
   USERNAME="$(safe_value "$USERNAME")"
@@ -798,10 +758,10 @@ process_report_record() {
   echo "  Outbound:        $OUTBOUND_TAG"
   echo "  Создан:          $CREATED_AT_FORMATTED"
 
-  ban_ip "$CLIENT_IP" "$BAN_TIMEOUT"
+  ban_ip "$CLIENT_IP" "$BAN_TIMEOUT" || return 1
 
   logger -t torrent-blocker \
-    "ingress_node=$INGRESS_NODE_NAME report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован"
+    "ingress_node=$INGRESS_NODE_NAME report_id=$ID user_id=$USER_ID username=$USERNAME uuid=$USER_UUID ip=$CLIENT_IP node=$NODE_NAME действие=заблокирован" || true
 
   PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
 }
@@ -810,51 +770,55 @@ run_blocker_once() {
   check_required_commands
   ensure_app_dir
   acquire_lock
-  load_runtime_config
-  require_api_config
-  init_last_id
-  ensure_nft
+  load_runtime_config || return 1
+  require_api_config || return 1
+  init_last_id || return 1
+  restore_bans || return 1
 
-GLOBAL_MAX_ID="$LAST_ID"
-PROCESSED_COUNT=0
-SKIPPED_COUNT=0
+  local page start data records count min_id previous_min=""
+  local collected='[]' complete=false record id ordered
+  PROCESSED_COUNT=0
+  SKIPPED_COUNT=0
 
-for (( PAGE=0; PAGE<MAX_PAGES; PAGE++ )); do
-  START=$(( PAGE * PAGE_SIZE ))
-
-  DATA="$(fetch_page "$START")"
-
-  RECORD_COUNT="$(echo "$DATA" | jq -r '(.response.records // []) | length')"
-
-  if [[ "$RECORD_COUNT" == "0" ]]; then
-    break
+  # Collect and validate the complete unseen window before applying any report.
+  # The endpoint must return newest IDs first; reject unexpected ordering.
+  for ((page=0; page<MAX_PAGES; page++)); do
+    start=$((page * PAGE_SIZE))
+    data="$(fetch_page "$start")" || return 1
+    if ! validate_reports <(printf '%s' "$data"); then
+      echo "Ошибка: неверная структура reports; last_id не изменён." >&2
+      return 1
+    fi
+    records="$(jq -c '.response.records | map(.id |= tonumber)' <<< "$data")" || return 1
+    count="$(jq 'length' <<< "$records")" || return 1
+    if (( count == 0 )); then
+      complete=true
+      break
+    fi
+    min_id="$(jq 'map(.id) | min' <<< "$records")" || return 1
+    if [[ -n "$previous_min" ]] && (( min_id >= previous_min && min_id > LAST_ID )); then
+      echo "Ошибка: страницы API не продвигаются; last_id не изменён." >&2
+      return 1
+    fi
+    previous_min="$min_id"
+    collected="$(printf '%s\n' "$collected" "$records" | jq -cs 'add | unique_by(.id)')" || return 1
+    if (( min_id <= LAST_ID || count < PAGE_SIZE )); then
+      complete=true
+      break
+    fi
+  done
+  if [[ "$complete" != true ]]; then
+    echo "Ошибка: превышено окно PAGE_SIZE × MAX_PAGES. Увеличьте лимит; last_id не изменён, новые reports не применены." >&2
+    return 1
   fi
-
-  PAGE_MAX_ID="$(echo "$DATA" | jq -r '[.response.records[]?.id // 0] | max // 0')"
-
-  if [[ "$PAGE_MAX_ID" =~ ^[0-9]+$ ]] && (( PAGE_MAX_ID > GLOBAL_MAX_ID )); then
-    GLOBAL_MAX_ID="$PAGE_MAX_ID"
-  fi
-
-  while read -r RECORD; do
-    [[ -z "$RECORD" ]] && continue
-    process_report_record "$RECORD"
-
-  done < <(
-    echo "$DATA" | jq -c --argjson last "$LAST_ID" '
-      (.response.records // [])
-      | sort_by(.id)
-      | .[]
-      | select((.id | tonumber) > $last)
-    '
-  )
-done
-
-if [[ "$GLOBAL_MAX_ID" =~ ^[0-9]+$ ]] && (( GLOBAL_MAX_ID > LAST_ID )); then
-  save_last_id "$GLOBAL_MAX_ID"
-fi
-
-echo "Готово. Обработано новых reports: $PROCESSED_COUNT. Пропущено: $SKIPPED_COUNT. Был last_id=$LAST_ID, стал last_id=$GLOBAL_MAX_ID"
+  ordered="$(jq -c --argjson last "$LAST_ID" 'sort_by(.id)[] | select(.id > $last)' <<< "$collected")" || return 1
+  while IFS= read -r record; do
+    [[ -z "$record" ]] && continue
+    process_report_record "$record" || return 1
+    id="$(jq -r '.id' <<< "$record")" || return 1
+    save_last_id "$id" || return 1
+  done <<< "$ordered"
+  echo "Готово. Обработано новых reports: $PROCESSED_COUNT. Пропущено: $SKIPPED_COUNT."
 }
 
 main() {
@@ -863,6 +827,14 @@ main() {
   command_name="$(basename "$0")"
 
   case "${1:-}" in
+    --restore)
+      check_required_commands
+      restore_bans
+      ;;
+    --add-panel)
+      require_menu_root
+      add_panel_instance
+      ;;
     menu|--menu)
       run_menu
       ;;
@@ -880,4 +852,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
