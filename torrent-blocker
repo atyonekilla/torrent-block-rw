@@ -69,6 +69,10 @@ load_runtime_config() {
   fi
 
   load_config_file "$ENV_FILE" || return 1
+  if [[ "${TELEGRAM_ENABLED:-false}" == true ]]; then
+    echo "Ошибка: эта версия не поддерживает Telegram-уведомления. Для обновления явно отключите TELEGRAM_ENABLED в старом конфиге." >&2
+    return 1
+  fi
 
   INSTANCE_NAME="${INSTANCE_NAME:-default}"
   SERVICE_UNIT="${SERVICE_UNIT:-torrent-blocker.service}"
@@ -827,6 +831,18 @@ main() {
   command_name="$(basename "$0")"
 
   case "${1:-}" in
+    --check-config)
+      check_required_commands
+      ensure_app_dir
+      load_runtime_config
+      require_api_config
+      if [[ ! -s "$LAST_ID_FILE" ]]; then
+        echo "Ошибка: last_id отсутствует или пуст; автоматический сброс при обновлении запрещён." >&2
+        return 1
+      fi
+      init_last_id
+      echo "Конфиг и last_id совместимы с новой версией."
+      ;;
     --restore)
       check_required_commands
       restore_bans

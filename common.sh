@@ -30,6 +30,8 @@ prompt_input() (
 config_key_allowed() {
   case "$1" in
     INSTANCE_NAME|SERVICE_UNIT|TIMER_UNIT|MENU_BIN|REMNAWAVE_API_BASE|REMNAWAVE_API_TOKEN|INGRESS_NODE_NAME|BAN_TIMEOUT|PAGE_SIZE|MAX_PAGES|REPORT_NODE_NAME|ALLOWLIST_IPV4) return 0 ;;
+    # Historical settings are retained as data for upgrades; no notifications are sent.
+    TELEGRAM_ENABLED|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_TOPIC_ID) return 0 ;;
     *) return 1 ;;
   esac
 }

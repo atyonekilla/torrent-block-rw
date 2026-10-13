@@ -7,6 +7,15 @@ PROJECT_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)"
 INSTALL_REF="${INSTALL_REF:-main}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/atyonekilla/torrent-block-rw/${INSTALL_REF}}"
 TMP_PROJECT_DIR=""
+INSTALL_FROM_STDIN=false
+[[ -n "${BASH_SOURCE[0]:-}" ]] || INSTALL_FROM_STDIN=true
+UPDATE_STAGE=""
+BACKUP_DIR=""
+UPDATE_IN_PROGRESS=false
+UPDATE_FILES_DIRTY=false
+UPDATE_TIMER_WAS_ACTIVE=false
+UPDATE_TARGETS=()
+INSTALL_LOCK_DIR="${TORRENT_BLOCKER_INSTALL_LOCK_DIR:-/run/lock}"
 
 INSTANCE_NAME=""
 APP_DIR=""
@@ -19,14 +28,27 @@ TIMER_DST=""
 MENU_BIN=""
 
 cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$UPDATE_IN_PROGRESS" == true ]]; then
+    echo "Обновление прервано; восстанавливаю предыдущую версию..." >&2
+    if ! rollback_update; then
+      echo "Ошибка отката. Резервная копия: $BACKUP_DIR. Проверьте сервис перед запуском." >&2
+      status=1
+    fi
+  fi
+  if [[ -n "$UPDATE_STAGE" && -d "$UPDATE_STAGE" ]]; then
+    rm -rf "$UPDATE_STAGE"
+  fi
   if [[ -n "$TMP_PROJECT_DIR" && -d "$TMP_PROJECT_DIR" ]]; then
     rm -rf "$TMP_PROJECT_DIR"
   fi
+  exit "$status"
 }
 
 trap cleanup EXIT
-
-
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 download_file() {
   local source_path="$1"
@@ -44,7 +66,7 @@ download_file() {
 }
 
 prepare_project_files() {
-  if [[ -f "${PROJECT_DIR}/torrent-blocker" && -f "${PROJECT_DIR}/common.sh" ]]; then
+  if [[ "$INSTALL_FROM_STDIN" == false && -f "${PROJECT_DIR}/torrent-blocker" && -f "${PROJECT_DIR}/common.sh" ]]; then
     return 0
   fi
 
@@ -109,12 +131,6 @@ default_ingress_node_name() {
     echo "$host_name"
   fi
 }
-
-
-
-
-
-
 
 load_env() {
   load_config_file "$ENV_FILE" || return 1
@@ -271,6 +287,142 @@ EOF
   fi
 }
 
+stage_systemd_units() {
+  local SERVICE_DST="$1" TIMER_DST="$2"
+  write_systemd_units
+}
+
+validate_project_files() {
+  local file
+  for file in torrent-blocker common.sh; do
+    [[ -s "$PROJECT_DIR/$file" ]] || { echo "Ошибка: не загружен $file" >&2; return 1; }
+    bash -n "$PROJECT_DIR/$file" || return 1
+  done
+}
+
+acquire_install_lock() {
+  exec 7>"${INSTALL_LOCK_DIR}/torrent-blocker-install-${INSTANCE_NAME}.lock"
+  if ! flock -n 7; then
+    echo "Ошибка: установка/обновление этого экземпляра уже выполняется." >&2
+    return 1
+  fi
+}
+
+atomic_install() {
+  local source_file="$1" target="$2" mode="$3" tmp
+  tmp="$(mktemp "${target}.XXXXXX")" || return 1
+  if ! install -m "$mode" "$source_file" "$tmp" || ! mv -Tf "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+backup_update_files() {
+  local i target
+  mkdir -p "$APP_DIR/backups"
+  chmod 700 "$APP_DIR/backups"
+  BACKUP_DIR="$(mktemp -d "$APP_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  mkdir "$BACKUP_DIR/files"
+  for i in "${!UPDATE_TARGETS[@]}"; do
+    target="${UPDATE_TARGETS[$i]}"
+    printf '%s\t%s\n' "$i" "$target" >> "$BACKUP_DIR/manifest.tsv"
+    if [[ -e "$target" || -L "$target" ]]; then
+      cp -a -- "$target" "$BACKUP_DIR/files/$i"
+    fi
+  done
+  # For manual recovery only. Automatic rollback must not rewind live report data.
+  cp -a -- "$ENV_FILE" "$BACKUP_DIR/config.env"
+  cp -a -- "$APP_DIR/last_id" "$BACKUP_DIR/last_id"
+}
+
+rollback_update() {
+  local i target tmp failed=false
+  if [[ "$UPDATE_FILES_DIRTY" == true ]]; then
+    systemctl stop "$TIMER_UNIT" || return 1
+    for i in "${!UPDATE_TARGETS[@]}"; do
+      target="${UPDATE_TARGETS[$i]}"
+      if [[ -e "$BACKUP_DIR/files/$i" || -L "$BACKUP_DIR/files/$i" ]]; then
+        tmp="$(mktemp -d "$(dirname "$target")/.torrent-blocker-rollback.XXXXXX")" || return 1
+        if ! cp -a -- "$BACKUP_DIR/files/$i" "$tmp/item" || ! mv -Tf "$tmp/item" "$target"; then
+          failed=true
+        fi
+        rm -rf "$tmp"
+      else
+        rm -f -- "$target" || failed=true
+      fi
+    done
+    systemctl daemon-reload || failed=true
+  fi
+  if [[ "$failed" == false && "$UPDATE_TIMER_WAS_ACTIVE" == true ]]; then
+    systemctl start "$TIMER_UNIT" || failed=true
+  fi
+  [[ "$failed" == false ]] || return 1
+  echo "Предыдущая версия и состояние таймера восстановлены." >&2
+}
+
+update_existing_installation() {
+  local expected_instance="$INSTANCE_NAME" expected_service="$SERVICE_UNIT"
+  local expected_timer="$TIMER_UNIT" expected_menu="$MENU_BIN" menu_target
+  local -a menu_targets=("$MENU_BIN")
+  load_env
+  if [[ "$INSTANCE_NAME" != "$expected_instance" || "$SERVICE_UNIT" != "$expected_service" ||
+        "$TIMER_UNIT" != "$expected_timer" ||
+        ( "$MENU_BIN" != "$expected_menu" && "$MENU_BIN" != "${expected_menu}-menu" ) ]]; then
+    echo "Ошибка: нестандартные пути/имена units в конфиге. Автообновление остановлено без замены файлов." >&2
+    return 1
+  fi
+
+  if [[ "$MENU_BIN" != "$expected_menu" ]]; then
+    menu_targets+=("$MENU_BIN")
+  fi
+  UPDATE_STAGE="$(mktemp -d "$APP_DIR/.update.XXXXXX")"
+  install -m 700 "$PROJECT_DIR/torrent-blocker" "$UPDATE_STAGE/torrent-blocker"
+  install -m 600 "$PROJECT_DIR/common.sh" "$UPDATE_STAGE/common.sh"
+  # Read-only validation with the new executable and the original configuration.
+  TORRENT_BLOCKER_APP_DIR="$APP_DIR" bash "$UPDATE_STAGE/torrent-blocker" --check-config
+  cat > "$UPDATE_STAGE/menu" <<EOF
+#!/usr/bin/env bash
+exec "${APP_DIR}/torrent-blocker" --menu "\$@"
+EOF
+  stage_systemd_units "$UPDATE_STAGE/service" "$UPDATE_STAGE/timer"
+  mkdir -p "$(dirname "$MENU_BIN")"
+  UPDATE_TARGETS=("$APP_DIR/torrent-blocker" "$APP_DIR/common.sh" "${menu_targets[@]}" "$SERVICE_DST" "$TIMER_DST")
+  if systemctl is-active --quiet "$TIMER_UNIT"; then
+    UPDATE_TIMER_WAS_ACTIVE=true
+  fi
+  UPDATE_IN_PROGRESS=true
+  if [[ "$UPDATE_TIMER_WAS_ACTIVE" == true ]]; then
+    systemctl stop "$TIMER_UNIT"
+  fi
+  # Let a running poll finish; do not interrupt it mid-report or mid-firewall update.
+  exec 9>"$APP_DIR/torrent-blocker.lock"
+  flock -w 300 -x 9
+  backup_update_files
+  UPDATE_FILES_DIRTY=true
+  atomic_install "$UPDATE_STAGE/common.sh" "$APP_DIR/common.sh" 600
+  atomic_install "$UPDATE_STAGE/torrent-blocker" "$APP_DIR/torrent-blocker" 700
+  for menu_target in "${menu_targets[@]}"; do
+    atomic_install "$UPDATE_STAGE/menu" "$menu_target" 755
+  done
+  # Preserve customized units, schedules, masks and all systemd drop-ins.
+  if [[ ! -e "$SERVICE_DST" && ! -L "$SERVICE_DST" ]]; then
+    atomic_install "$UPDATE_STAGE/service" "$SERVICE_DST" 644
+  fi
+  if [[ ! -e "$TIMER_DST" && ! -L "$TIMER_DST" ]]; then
+    atomic_install "$UPDATE_STAGE/timer" "$TIMER_DST" 644
+  fi
+  systemctl daemon-reload
+  TORRENT_BLOCKER_APP_DIR="$APP_DIR" bash "$APP_DIR/torrent-blocker" --check-config
+  # start never changes enabled/disabled state. Disabled timers stay disabled.
+  if [[ "$UPDATE_TIMER_WAS_ACTIVE" == true ]]; then
+    systemctl start "$TIMER_UNIT"
+  fi
+  UPDATE_IN_PROGRESS=false
+  flock -u 9
+  echo "Обновление завершено. Конфиг, last_id, баны и настройки systemd сохранены."
+  echo "Резервная копия: $BACKUP_DIR"
+}
+
 main() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "Ошибка: установку нужно запускать от root"
@@ -282,9 +434,11 @@ main() {
     exit 1
   fi
   prepare_project_files
+  validate_project_files
   source "${PROJECT_DIR}/common.sh"
   install_dependencies
   configure_instance
+  acquire_install_lock
 
   echo
   echo "╭────────────────────────────────────╮"
@@ -294,18 +448,16 @@ main() {
   echo "Каталог:   ${APP_DIR}"
   echo
 
-  HAS_EXISTING_ENV="false"
-
-  if [[ -f "${APP_DIR}/.env" ]]; then
-    HAS_EXISTING_ENV="true"
-    echo "Файл $ENV_FILE уже существует, не перезаписываю"
-    load_env
-    configure_instance
-    check_remnawave_panel
-  else
-    collect_new_config
+  if [[ -f "$ENV_FILE" ]]; then
+    echo "Обнаружена существующая установка. Обновляю без повторного ввода настроек."
+    update_existing_installation
+    return
   fi
-
+  if [[ -e "$APP_DIR/torrent-blocker" ]]; then
+    echo "Ошибка: найдена старая установка без .env. Восстановите конфиг перед обновлением." >&2
+    return 1
+  fi
+  collect_new_config
 
   echo
   echo "Создание директории ${APP_DIR}..."
@@ -326,19 +478,7 @@ main() {
   install -m 600 "${PROJECT_DIR}/common.sh" "${APP_DIR}/common.sh"
   rm -f "${APP_DIR}/menu"
 
-  if [[ "$HAS_EXISTING_ENV" == "false" ]]; then
-    write_env_file
-  else
-    set_env "INSTANCE_NAME" "$INSTANCE_NAME"
-    set_env "SERVICE_UNIT" "$SERVICE_UNIT"
-    set_env "TIMER_UNIT" "$TIMER_UNIT"
-    set_env "MENU_BIN" "$MENU_BIN"
-
-    if [[ -z "$(get_env INGRESS_NODE_NAME)" ]]; then
-      INGRESS_NODE_NAME="$(default_ingress_node_name)"
-      set_env "INGRESS_NODE_NAME" "$INGRESS_NODE_NAME"
-    fi
-  fi
+  write_env_file
 
   load_env
 
@@ -395,6 +535,6 @@ main() {
 
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
   main "$@"
 fi

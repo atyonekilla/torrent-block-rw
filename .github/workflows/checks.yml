@@ -6,6 +6,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y jq nftables shellcheck
-      - run: bash -n common.sh install.sh torrent-blocker
+      - run: for script in common.sh install.sh torrent-blocker; do bash -n "$script"; done
       - run: shellcheck -x common.sh install.sh torrent-blocker
       - run: python3 -m unittest discover -s tests -v
